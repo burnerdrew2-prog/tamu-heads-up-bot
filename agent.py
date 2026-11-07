@@ -40,26 +40,35 @@ warmup()
 
 # rename as your team/bot's name
 PARTICIPANT = "drew"
-AGENT_NAME = "drew_v1"
+AGENT_NAME = "drew_v2"
 
 
 # ===== YOUR CODE HERE =====
-# Fallback bot: equity against a random hand, priced against the pot.
-#   Preflop: a fitted formula for equity vs a random hand (pairs, suits,
-#   connectedness, high cards; R^2 0.66 against simulation), no sampling.
-#   Postflop: Monte Carlo equity vs a random hand (up to 16 samples), lowered when
-#   the opponent bets or raises, more so if they rarely do.
-#   The sample count adapts so our own thinking stays near 3 s per half.
+# drew_v2: equity against the hands the opponent is likely to hold.
+#   Preflop strength: a fitted formula for equity vs a random hand (pairs,
+#   suits, connectedness, high cards; R^2 0.66 against simulation).
+#   Postflop: Monte Carlo against opponent hands weighted by what they did
+#   this hand (preflop raises -> top of the formula; bets and raises after
+#   the flop -> made hands), scaled by how often this opponent raises.
+#   Position: wider raising on the button. Reads: bluff more against
+#   opponents who fold to our raises, never bluff stations.
+#   The sample count adapts so our own thinking stays near 2.2 s per half.
 
+import math
 import random
 import time
+from statistics import NormalDist
+
+from evaluator import category_of
 
 PRE_W = (0.0655, 0.0588, -0.0641, 0.0317, -0.0035, -0.0279, 0.0075, 0.0609, 0.237)
-# The judge's 8 s bank per 1000-hand half also pays for request handling
-# (about 1 ms a call), so our own thinking is budgeted at OWN_BUDGET seconds
-# and the sample count shrinks as it is used up.
-OWN_BUDGET = 3.0
+PRE_MEAN, PRE_SD = 0.50, 0.072      # distribution of preflop_equity over random hands
+OWN_BUDGET = 2.2
 HALF_HANDS = 1000
+_ND = NormalDist()
+# Likelihood of betting or raising after the flop, by final hand category
+# (high card .. straight flush), for an opponent who raises at the prior rate.
+CAT_W = (0.20, 0.40, 0.75, 0.95, 1.0, 1.0, 1.0, 1.0, 1.0)
 
 
 def _action_name(a) -> str:
@@ -90,29 +99,63 @@ def preflop_equity(hole) -> float:
     return sum(w * x for w, x in zip(PRE_W, f))
 
 
-def mc_equity(hole, board, n, rng) -> float:
+def _rate(memory, hits, total, prior, k=8.0):
+    return (memory.get(hits, 0) + prior * k) / (memory.get(total, 0) + k)
+
+
+def _opp_profile(obs, memory):
+    """What the opponent did this hand, and how often they raise in general."""
+    pf_raises = post_raises = 0
+    for a in obs.action_history:
+        if not a.is_me and "RAISE" in _action_name(a.action):
+            if a.street == Street.PREFLOP:
+                pf_raises += 1
+            else:
+                post_raises += 1
+    pf_rate = _rate(memory, "opp_pf_raises", "opp_pf_acts", 0.35)
+    post_rate = _rate(memory, "opp_post_raises", "opp_post_acts", 0.30)
+    return pf_raises, post_raises, pf_rate, post_rate
+
+
+def mc_equity(hole, board, n, rng, profile) -> float:
+    """Equity against opponent hands weighted by their actions this hand."""
+    pf_raises, post_raises, pf_rate, post_rate = profile
     known = set(hole) | set(board)
     deck = [c for c in range(36) if c not in known]
     need = 5 - len(board)
-    wins = 0.0
+    t_pf = PRE_MEAN + PRE_SD * _ND.inv_cdf(min(max(1 - pf_rate, 0.02), 0.98)) if pf_raises else 0.0
+    # Opponents who raise a lot after the flop say less with each raise.
+    gamma = min(max(1.5 * (0.6 - post_rate) / 0.3, 0.15), 1.5) if post_raises else 0.0
+    num = den = 0.0
     for _ in range(n):
         d = rng.sample(deck, 5 + need)
+        opp = d[:5]
         full = list(board) + d[5:]
         a = omaha_score(hole, full)
-        b = omaha_score(d[:5], full)
-        wins += 1.0 if a > b else (0.5 if a == b else 0.0)
-    return wins / n
+        b = omaha_score(opp, full)
+        w = 1.0
+        if pf_raises:
+            w *= 0.05 + 1.0 / (1.0 + math.exp(-30.0 * (preflop_equity(opp) - t_pf)))
+        if post_raises:
+            w *= CAT_W[category_of(b)] ** (gamma * min(post_raises, 2))
+        num += w * (1.0 if a > b else (0.5 if a == b else 0.0))
+        den += w
+    return num / den if den > 0 else 0.5
 
 
-def _track_opponent(obs, memory):
+def _track(obs, memory):
+    """Count the opponent's raises (per street type) from new history entries."""
     seen = memory.setdefault("seen", {})
     hist = obs.action_history
     start = seen.get(obs.hand_index, 0)
     for a in hist[start:]:
-        if not a.is_me:
-            memory["opp_acts"] = memory.get("opp_acts", 0) + 1
-            if "RAISE" in _action_name(a.action):
-                memory["opp_raises"] = memory.get("opp_raises", 0) + 1
+        if a.is_me:
+            continue
+        pre = a.street == Street.PREFLOP
+        memory["opp_pf_acts" if pre else "opp_post_acts"] = memory.get("opp_pf_acts" if pre else "opp_post_acts", 0) + 1
+        if "RAISE" in _action_name(a.action):
+            key = "opp_pf_raises" if pre else "opp_post_raises"
+            memory[key] = memory.get(key, 0) + 1
     seen[obs.hand_index] = len(hist)
     if len(seen) > 4:
         for k in sorted(seen)[:-2]:
@@ -131,54 +174,63 @@ def _pick(obs, wanted):
 
 
 def _decide(obs, memory):
-    _track_opponent(obs, memory)
-    acts = memory.get("opp_acts", 0)
-    opp_rate = (memory.get("opp_raises", 0) + 3) / (acts + 10)   # prior 0.3
-    opp_raised = any((not a.is_me) and a.street == obs.street and "RAISE" in _action_name(a.action)
-                     for a in obs.action_history)
+    _track(obs, memory)
+    profile = _opp_profile(obs, memory)
+    pf_raises, post_raises, pf_rate, post_rate = profile
+    fold_rate = _rate(memory, "opp_folds_to_raise", "our_raises_seen", 0.35)
     to_call = obs.to_call
     need = to_call / max(obs.pot + to_call, 1)
     raises = obs.raises_this_street
+    button = obs.is_button
 
     if obs.street == Street.PREFLOP:
         eq = preflop_equity(obs.hole_cards)
+        # A raiser's range is the top of the formula; price our hand against it.
+        if pf_raises:
+            t = PRE_MEAN + PRE_SD * _ND.inv_cdf(min(max(1 - pf_rate, 0.02), 0.98))
+            eq_vs = 0.5 + 1.6 * (eq - max(t + 0.02, PRE_MEAN))
+        else:
+            eq_vs = eq
         if raises >= 2:
-            if eq >= 0.62:
+            if eq_vs >= 0.60:
                 return _pick(obs, [Action.RAISE_POT, Action.CHECK_CALL])
-            return _pick(obs, [Action.CHECK_CALL] if eq >= 0.55 - 0.05 * (opp_rate > 0.5) else [Action.FOLD])
-        if eq >= 0.60:
+            return Action.CHECK_CALL if eq_vs >= max(need + 0.10, 0.42) else _pick(obs, [Action.FOLD])
+        # Steal wider from opponents who fold to our raises.
+        open_t = (0.52 if button else 0.55) - (0.04 if fold_rate >= 0.45 else 0.0)
+        if eq >= 0.60 or (pf_raises and eq_vs >= 0.58):
             return _pick(obs, [Action.RAISE_POT, Action.RAISE_HALF])
-        if eq >= 0.55 and raises == 0:
+        if eq >= open_t and raises == 0:
             return _pick(obs, [Action.RAISE_HALF])
         if to_call == 0:
             return Action.CHECK_CALL
-        floor = 0.46 if opp_rate > 0.5 else 0.49
-        if eq >= max(floor, need + 0.12) or to_call <= obs.big_blind // 2:
+        if eq_vs >= max(0.44, need + 0.10) or to_call <= obs.big_blind // 2:
             return Action.CHECK_CALL
         return _pick(obs, [Action.FOLD])
 
     spent = memory.get("spent", 0.0)
     left_hands = max(HALF_HANDS - obs.hand_index, 1)
-    per_hand = (OWN_BUDGET - spent) / left_hands          # seconds we may still spend per hand
-    n = 0 if per_hand <= 0 else min(16, int(per_hand / 0.00025))   # ~80 us a sample, ~3 postflop calls a hand
+    per_hand = (OWN_BUDGET - spent) / left_hands
+    n = 0 if per_hand <= 0 else min(16, int(per_hand / 0.00028))
     if n >= 4:
         rng = random.Random(obs.hand_index * 7919 + len(obs.board) * 31 + raises)
-        eq = mc_equity(obs.hole_cards, obs.board, n, rng)
+        eq = mc_equity(obs.hole_cards, obs.board, n, rng, profile)
     else:
         eq = preflop_equity(obs.hole_cards)
-    if opp_raised:
-        eq -= 0.12 if opp_rate < 0.25 else (0.07 if opp_rate < 0.5 else 0.02)
+    in_pos = button          # the button acts last after the flop
     if to_call == 0:
-        if eq >= 0.75:
+        if eq >= 0.72:
             return _pick(obs, [Action.RAISE_POT, Action.RAISE_HALF])
-        if eq >= 0.62:
+        if eq >= (0.58 if in_pos else 0.62):
+            return _pick(obs, [Action.RAISE_HALF])
+        # Bluff only opponents who fold to our raises, and mostly in position.
+        if fold_rate >= 0.5 and eq >= (0.30 if in_pos else 0.38) and obs.street != Street.RIVER:
             return _pick(obs, [Action.RAISE_HALF])
         return Action.CHECK_CALL
-    if eq >= 0.80 and raises < 3:
+    if eq >= 0.78 and raises < 3:
         return _pick(obs, [Action.RAISE_POT, Action.RAISE_HALF])
-    if eq >= 0.70 and raises < 2:
+    if eq >= 0.68 and raises < 2:
         return _pick(obs, [Action.RAISE_HALF, Action.CHECK_CALL])
-    if eq >= need + 0.04:
+    if eq >= need + 0.03:
         return Action.CHECK_CALL
     return _pick(obs, [Action.FOLD])
 
@@ -198,13 +250,22 @@ def choose_action(obs: Observation, memory: dict) -> Action:
             action = _pick(obs, [Action.CHECK_CALL, Action.FOLD])
     except Exception:
         action = _pick(obs, [Action.CHECK_CALL, Action.FOLD])
+    memory["last_action"] = (obs.hand_index, _action_name(action))
     memory["spent"] = memory.get("spent", 0.0) + (time.perf_counter() - t0)
     return action
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
-    """Called once for every finished hand."""
+    """Called once for every finished hand: learn whether they fold to our raises."""
     memory["hands_played"] = memory.get("hands_played", 0) + 1
+    try:
+        last = memory.get("last_action")
+        if last and last[0] == result.hand_index and "RAISE" in last[1]:
+            memory["our_raises_seen"] = memory.get("our_raises_seen", 0) + 1
+            if result.winner == "me" and not result.went_to_showdown:
+                memory["opp_folds_to_raise"] = memory.get("opp_folds_to_raise", 0) + 1
+    except Exception:
+        pass
 
 # ===== END OF YOUR CODE =====
 
