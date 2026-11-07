@@ -40,11 +40,11 @@ warmup()
 
 # rename as your team/bot's name
 PARTICIPANT = "drew"
-AGENT_NAME = "drew_v2"
+AGENT_NAME = "drew_v3"
 
 
 # ===== YOUR CODE HERE =====
-# drew_v2: equity against the hands the opponent is likely to hold.
+# drew_v3: equity against the hands the opponent is likely to hold.
 #   Preflop strength: a fitted formula for equity vs a random hand (pairs,
 #   suits, connectedness, high cards; R^2 0.66 against simulation).
 #   Postflop: Monte Carlo against opponent hands weighted by what they did
@@ -52,23 +52,104 @@ AGENT_NAME = "drew_v2"
 #   the flop -> made hands), scaled by how often this opponent raises.
 #   Position: wider raising on the button. Reads: bluff more against
 #   opponents who fold to our raises, never bluff stations.
-#   The sample count adapts so our own thinking stays near 2.2 s per half.
+#   A numpy copy of the official 5-card table scores ~100-160 sampled
+#   runouts per decision (v2 managed 7-8); the count adapts to the measured
+#   cost so our own thinking stays near 2.4 s per half.
 
 import math
 import random
 import time
+from itertools import combinations as _combinations
+from math import comb as _comb
 from statistics import NormalDist
 
-from evaluator import category_of
+import numpy as np
+
+from evaluator import get_table
 
 PRE_W = (0.0655, 0.0588, -0.0641, 0.0317, -0.0035, -0.0279, 0.0075, 0.0609, 0.237)
 PRE_MEAN, PRE_SD = 0.50, 0.072      # distribution of preflop_equity over random hands
-OWN_BUDGET = 2.2
+OWN_BUDGET = 2.4
+MAX_SAMPLES = 160
+BET_SHARP = 2.0       # how strongly a postflop bet narrows their range (v2: 1.0)
+CALL_MARGIN = 0.06    # equity needed above the price to call a postflop bet (v2: 0.03)
 HALF_HANDS = 1000
 _ND = NormalDist()
 # Likelihood of betting or raising after the flop, by final hand category
 # (high card .. straight flush), for an opponent who raises at the prior rate.
 CAT_W = (0.20, 0.40, 0.75, 0.95, 1.0, 1.0, 1.0, 1.0, 1.0)
+
+
+# ---- Vectorized evaluator: the official 5-card table as a numpy array indexed
+# by the colex rank of the 5 cards, so many hands score in one array lookup.
+_COMB = np.array([[_comb(n, k) for k in range(6)] for n in range(37)], dtype=np.int64)
+_PAIRS = np.array(list(_combinations(range(5), 2)))
+_TRIPS = np.array(list(_combinations(range(5), 3)))
+
+
+def _build_score_array():
+    arr = np.zeros(_comb(36, 5), dtype=np.int32)
+    for mask, score in get_table().items():
+        cards = [i for i in range(36) if mask >> i & 1]
+        arr[sum(_comb(c, k + 1) for k, c in enumerate(cards))] = score
+    return arr
+
+
+_SCORE = _build_score_array()
+
+
+def omaha_vec(hole, board):
+    """Best Omaha score for each row: hole (N,5) and board (N,5) int arrays."""
+    hp = hole[:, _PAIRS]
+    bt = board[:, _TRIPS]
+    n = len(hole)
+    five = np.concatenate([np.broadcast_to(hp[:, :, None, :], (n, 10, 10, 2)),
+                           np.broadcast_to(bt[:, None, :, :], (n, 10, 10, 3))], axis=3)
+    five = np.sort(five, axis=3)
+    idx = (_COMB[five[..., 0], 1] + _COMB[five[..., 1], 2] + _COMB[five[..., 2], 3]
+           + _COMB[five[..., 3], 4] + _COMB[five[..., 4], 5])
+    return _SCORE[idx].reshape(n, -1).max(axis=1)
+
+
+def _run_table():
+    out = np.zeros(512, dtype=np.int64)
+    for m in range(512):
+        distinct = [r for r in range(9) if m >> r & 1]
+        best = run = 1
+        for a, b in zip(distinct, distinct[1:]):
+            run = run + 1 if b - a <= 2 else 1
+            best = max(best, run)
+        out[m] = best if distinct else 0
+    return out
+
+
+_RUN = _run_table()
+_R9 = np.arange(9)
+_S4 = np.arange(4)
+_PRE_W = None  # set after PRE_W below
+
+
+def preflop_equity_vec(hands):
+    """preflop_equity() for every row of hands (N,5), vectorized."""
+    ranks = hands >> 2
+    suits = hands & 3
+    cnt = (ranks[:, :, None] == _R9).sum(1)
+    sc = (suits[:, :, None] == _S4).sum(1)
+    ace_suit = ((ranks == 8)[:, :, None] & (suits[:, :, None] == _S4)).any(1)
+    present = (cnt > 0).astype(np.int64)
+    mask = (present << _R9).sum(1)
+    f = np.stack([
+        ((cnt == 2) & (_R9 >= 6)).sum(1),
+        ((cnt == 2) & (_R9 < 6)).sum(1),
+        (cnt >= 3).sum(1),
+        (sc >= 2).sum(1),
+        ((sc >= 2) & ace_suit).sum(1),
+        (sc >= 4).sum(1),
+        _RUN[mask],
+        ranks.sum(1) / 8.0,
+        np.ones(len(hands)),
+    ], axis=1).astype(np.float64)
+    return f @ np.array(PRE_W)
 
 
 def _note(memory, text):
@@ -124,29 +205,29 @@ def _opp_profile(obs, memory):
 
 
 def mc_equity(hole, board, n, rng, profile) -> float:
-    """Equity against opponent hands weighted by their actions this hand."""
+    """Equity against opponent hands weighted by their actions this hand (vectorized)."""
     pf_raises, post_raises, pf_rate, post_rate = profile
     known = set(hole) | set(board)
-    deck = [c for c in range(36) if c not in known]
+    deck = np.array([c for c in range(36) if c not in known], dtype=np.int64)
     need = 5 - len(board)
-    t_pf = PRE_MEAN + PRE_SD * _ND.inv_cdf(min(max(1 - pf_rate, 0.02), 0.98)) if pf_raises else 0.0
-    # Opponents who raise a lot after the flop say less with each raise.
-    gamma = min(max(1.5 * (0.6 - post_rate) / 0.3, 0.15), 1.5) if post_raises else 0.0
-    num = den = 0.0
-    for _ in range(n):
-        d = rng.sample(deck, 5 + need)
-        opp = d[:5]
-        full = list(board) + d[5:]
-        a = omaha_score(hole, full)
-        b = omaha_score(opp, full)
-        w = 1.0
-        if pf_raises:
-            w *= 0.05 + 1.0 / (1.0 + math.exp(-30.0 * (preflop_equity(opp) - t_pf)))
-        if post_raises:
-            w *= CAT_W[category_of(b)] ** (gamma * min(post_raises, 2))
-        num += w * (1.0 if a > b else (0.5 if a == b else 0.0))
-        den += w
-    return num / den if den > 0 else 0.5
+    picks = rng.random((n, len(deck))).argsort(axis=1)[:, :5 + need]
+    drawn = deck[picks]
+    opp = drawn[:, :5]
+    full = np.concatenate([np.broadcast_to(np.array(board, dtype=np.int64), (n, len(board))), drawn[:, 5:]], axis=1)
+    mine = np.broadcast_to(np.array(hole, dtype=np.int64), (n, 5))
+    scores = omaha_vec(np.concatenate([mine, opp]), np.concatenate([full, full]))
+    a, b = scores[:n], scores[n:]
+    w = np.ones(n)
+    if pf_raises:
+        t_pf = PRE_MEAN + PRE_SD * _ND.inv_cdf(min(max(1 - pf_rate, 0.02), 0.98))
+        w *= 0.05 + 1.0 / (1.0 + np.exp(-30.0 * (preflop_equity_vec(opp) - t_pf)))
+    if post_raises:
+        # Opponents who raise a lot after the flop say less with each raise.
+        gamma = BET_SHARP * min(max(1.5 * (0.6 - post_rate) / 0.3, 0.15), 1.5)
+        w *= np.array(CAT_W)[b >> 20] ** (gamma * min(post_raises, 2))
+    win = (a > b) + 0.5 * (a == b)
+    den = w.sum()
+    return float((w * win).sum() / den) if den > 0 else 0.5
 
 
 def _track(obs, memory):
@@ -218,10 +299,13 @@ def _decide(obs, memory):
     spent = memory.get("spent", 0.0)
     left_hands = max(HALF_HANDS - obs.hand_index, 1)
     per_hand = (OWN_BUDGET - spent) / left_hands
-    n = 0 if per_hand <= 0 else min(16, int(per_hand / 0.00028))
-    if n >= 4:
-        rng = random.Random(obs.hand_index * 7919 + len(obs.board) * 31 + raises)
+    cost = memory.get("sample_cost", 1.2e-5)        # seconds per sample, measured
+    n = 0 if per_hand <= 0 else min(MAX_SAMPLES, int(0.5 * per_hand / cost))
+    if n >= 16:
+        rng = np.random.default_rng(obs.hand_index * 7919 + len(obs.board) * 31 + raises)
+        t1 = time.perf_counter()
         eq = mc_equity(obs.hole_cards, obs.board, n, rng, profile)
+        memory["sample_cost"] = 0.8 * cost + 0.2 * (time.perf_counter() - t1) / n
     else:
         eq = preflop_equity(obs.hole_cards)
     in_pos = button          # the button acts last after the flop
@@ -234,14 +318,14 @@ def _decide(obs, memory):
         if eq >= (0.58 if in_pos else 0.62):
             return _pick(obs, [Action.RAISE_HALF])
         # Bluff only opponents who fold to our raises, and mostly in position.
-        if fold_rate >= 0.5 and eq >= (0.30 if in_pos else 0.38) and obs.street != Street.RIVER:
+        if fold_rate >= 0.6 and eq >= (0.30 if in_pos else 0.38) and obs.street != Street.RIVER:
             return _pick(obs, [Action.RAISE_HALF])
         return Action.CHECK_CALL
     if eq >= 0.78 and raises < 3:
         return _pick(obs, [Action.RAISE_POT, Action.RAISE_HALF])
     if eq >= 0.68 and raises < 2:
         return _pick(obs, [Action.RAISE_HALF, Action.CHECK_CALL])
-    if eq >= need + 0.03:
+    if eq >= need + CALL_MARGIN:
         return Action.CHECK_CALL
     return _pick(obs, [Action.FOLD])
 
