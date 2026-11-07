@@ -65,7 +65,8 @@ class WalkState:
     folded: Optional[int]
 
 
-def walk(history: Sequence[ActionRecord], hero_is_button: bool, sb: float, bb: float):
+def walk(history: Sequence[ActionRecord], hero_is_button: bool, sb: float, bb: float,
+         split_4bet: bool = False):
     """Return (points, final_state)."""
     button = HERO if hero_is_button else OPP
     big = 1 - button
@@ -94,8 +95,10 @@ def walk(history: Sequence[ActionRecord], hero_is_button: bool, sb: float, bb: f
             elif raises == 1:
                 # facing the first raise: after limping (already in voluntarily) or as an open
                 ctx = "limp_vs_raise" if a in acted else "vs_raise"
-            else:
+            elif raises == 2 or not split_4bet:
                 ctx = "vs_reraise"
+            else:
+                ctx = "vs_4bet"          # facing a 4-bet or more (their range is narrow)
         else:
             if to_call > 0:
                 ctx = "facing_bet" if raises <= 1 else "facing_raise"
@@ -151,3 +154,19 @@ def opponent_line(points) -> str:
 
 __all__ = ["DecisionPoint", "walk", "size_bucket", "infer_button", "opponent_line",
            "N_BUCKETS", "CHECK"]
+
+
+def scare_card(board: Sequence[int], street: int) -> bool:
+    """True if the card that arrived on ``street`` (2 turn, 3 river) is a scare card:
+    it pairs the board, puts a third card of one suit on the board, or is a K or A
+    (ranks 7, 8; cards are rank * 4 + suit)."""
+    n = {2: 4, 3: 5}.get(street)
+    if n is None or len(board) < n:
+        return False
+    new = int(board[n - 1])
+    before = [int(c) for c in board[:n - 1]]
+    if any((c >> 2) == (new >> 2) for c in before):
+        return True
+    if sum(1 for c in board[:n] if (c & 3) == (new & 3)) == 3:
+        return True
+    return (new >> 2) >= 7

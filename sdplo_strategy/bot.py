@@ -22,7 +22,7 @@ import numpy as np
 from .cards import BOARD_LEN, remaining_deck, random_hands
 from .decision import DecisionEngine, Spot
 from .equity import EquityEngine, make_outcomes_fn
-from .history import infer_button, opponent_line, walk
+from .history import infer_button, opponent_line, scare_card, walk
 from .opponent import Beta, OpponentModel, Priors, outcome_index
 from .preflop import PreflopScorer, PreflopTable
 from .ranges import RangeTracker, eval_many
@@ -114,8 +114,18 @@ class TimeKeeper:
         self.ema_cost = None    # recent full wall cost of a non-cheap decision
         self.last_elapsed = 0.0
 
+    def overhead(self) -> float:
+        """Per-request time we cannot see (server, JSON).  Under CPU contention it
+        grows like our own decisions do, so it is scaled by how slow our recent
+        decisions run vs ``overhead_ref_cost`` (never below the base estimate)."""
+        o = self.s.request_overhead
+        ref = self.s.overhead_ref_cost
+        if ref > 0 and self.ema_cost:
+            o *= min(3.0, max(1.0, self.ema_cost / ref))
+        return o
+
     def charge(self, elapsed: float) -> float:
-        return max(0.0, elapsed + self.s.request_overhead - self.s.request_grace)
+        return max(0.0, elapsed + self.overhead() - self.s.request_grace)
 
     def remaining(self) -> Optional[float]:
         if self.s.match_time_budget is None:
@@ -128,7 +138,7 @@ class TimeKeeper:
         if self.s.match_time_budget is not None:
             hands_left = max(1, self.s.hands_per_match - hand_number)
             per = max(0.0, self.remaining()) / (hands_left * self.decisions_per_hand)
-            lim = min(lim, per + self.s.request_grace - self.s.request_overhead)
+            lim = min(lim, per + self.s.request_grace - self.overhead())
         return max(lim, 1e-4)
 
     def hint(self, hand_number: int = 0) -> float:
@@ -233,6 +243,7 @@ class StrategyBot:
         self.pot_mismatches = 0
         self.last_decision: dict = {}
         self._was_cheap = False
+        self._pending_bets: list = []     # (hand number, model's raw fold share) for our postflop bets
 
     # -------------------------------------------------------------- public
     def act(self, obs: Observation, rng: Optional[np.random.Generator] = None) -> Action:
@@ -336,12 +347,16 @@ class StrategyBot:
         hs.last_obs = obs
         hs.range.rng = self.rng
         button = self._button(obs)
-        points, state = walk(obs.history, button, obs.small_blind, obs.big_blind)
+        points, state = walk(obs.history, button, obs.small_blind, obs.big_blind,
+                             split_4bet=self.s.split_preflop_4bet)
         if abs(state.pot - obs.pot) > 1e-6:
             self.pot_mismatches += 1
         split_obs = self.s.split_bluff_observe
 
-        def bluff_of(ctx):
+        def bluff_of(ctx, street=0):
+            if (self.s.scare_bluff_split and ctx in ("lead", "checked_to")
+                    and scare_card(obs.board, street)):
+                return self.model.bluff_scare.p
             return self.model.bluff_share(ctx, split=True) if split_obs else self.model.bluff_share(ctx)
         kappa = (self.model.informativeness(0), self.model.informativeness(1))
         # folds/calls are at least as strength-driven as bets (max: equity bots read 1.0
@@ -353,7 +368,7 @@ class StrategyBot:
             hs.range.set_board(obs.board[:BOARD_LEN[p.street]])
             freqs = self.model.freqs(p.context, p.street, p.frac)
             hs.range.observe(outcome_index(p.kind), freqs,
-                             bluff_share=bluff_of(p.context) * (0.5 if p.street == 0 else 1.0),
+                             bluff_share=bluff_of(p.context, p.street) * (0.5 if p.street == 0 else 1.0),
                              informativeness=kappa[0] if p.street == 0 else kappa[1],
                              call_informativeness=None if p.street == 0 else kappa_call)
         hs.points_seen = len(points)
@@ -384,6 +399,8 @@ class StrategyBot:
         if opt.action.kind == RAISE:
             # the conditions under which their response frequencies are learned
             self.model.observe_bet_strength(obs.street, hs.range.abs_strength_mean())
+            if obs.street > 0 and "p_fold_raw" in opt.info:
+                self._pending_bets.append((obs.hand_number, float(opt.info["p_fold_raw"])))
         if vr is not None and any(o.action.kind == RAISE for o in options):
             vr.observe_bool(opt.action.kind == RAISE and reason == "ev"
                             and opt.info.get("eq_call", 0.0) >= 0.5)
@@ -400,13 +417,31 @@ class StrategyBot:
             hero_is_button = infer_button(history)
             if hero_is_button is None:
                 return
-        points, _ = walk(history, hero_is_button, sb, bb)
+        points, _ = walk(history, hero_is_button, sb, bb, split_4bet=self.s.split_preflop_4bet)
         line = opponent_line(points)
+        self._settle_bets(points)
         shown = shown_pre = None
         if opp_hole is not None and len(opp_hole) == 5 and board is not None and len(board) == 5:
             shown = self._showdown_strength(tuple(opp_hole), tuple(board))
             shown_pre = self.scorer.percentile(self.scorer.equity(tuple(opp_hole)))
-        self.model.record_hand(points, line, shown, shown_pre)
+        scare = None
+        if self.s.scare_bluff_split and board is not None and len(board) == 5:
+            scare = {st for st in (2, 3) if scare_card(board, st)}
+        self.model.record_hand(points, line, shown, shown_pre, scare)
+
+    def _settle_bets(self, points) -> None:
+        """Match our postflop bets this hand with whether the opponent folded to them."""
+        pend, self._pending_bets = self._pending_bets, []
+        if not pend:
+            return
+        outcomes = []
+        for i, p in enumerate(points):
+            if p.actor == OPP or p.kind != RAISE or p.street == 0:
+                continue
+            nxt = next((q for q in points[i + 1:] if q.actor == OPP), None)
+            outcomes.append(nxt is not None and nxt.kind == FOLD and nxt.street == p.street)
+        for (hn, pred), folded in zip(pend[-len(outcomes):] if outcomes else [], outcomes[-len(pend):]):
+            self.engine.record_fold_outcome(pred, folded)
 
     def _showdown_strength(self, opp_hole: tuple, board: tuple) -> float:
         """Percentile of the shown hand vs random hands on the final board."""

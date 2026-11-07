@@ -30,6 +30,7 @@ class Settings:
     bank_reserve: float = 0.0         # seconds of the bank never planned for
     cheap_below: float = 0.0          # per-decision allowance (s) under which the cheap path runs
     cheap_hint: float = 0.3           # with a bank: allowance / recent decision cost under which it runs
+    overhead_ref_cost: float = 0.0    # >0: scale request_overhead by recent decision cost / this
     # --- decisions ------------------------------------------------------
     raise_fracs: tuple = (1 / 3, 2 / 3, 1.0)   # fractions of the pot-limit raise
     realization_ip: float = 0.95
@@ -54,9 +55,17 @@ class Settings:
     split_bluff_decide: bool = False  # their re-raise range uses the raise-specific bluff share
     split_bluff_observe: bool = False # ... and so does the range update after their raises
     cap_reraise_equity: bool = False  # equity vs their re-raising range <= vs their calling range
+    split_preflop_4bet: bool = False  # preflop: facing a 4-bet+ is its own context (vs 3-bet)
+    strength_fold_from_street: int = 0  # strength_adjust applies from this street on
+    preflop_range_realization: float = 0.0  # preflop rho *= 1 - c * (their range strength - 0.5)+
+    scare_bluff_split: bool = False   # own bluff share for their bets on scare-card turns / rivers
     rz_min: float = 0.5               # ... clipped to [rz_min, rz_max]
     rz_max: float = 1.5
     fold_scale_from_street: int = 1   # ... on this street and later
+    fold_calibrate: bool = False      # learn the fold multiplier online (fold_scale = its prior)
+    fold_calibrate_strength: float = 20.0   # prior weight, in bets
+    fold_calibrate_min: float = 0.4
+    fold_calibrate_max: float = 1.4
     postflop_max_raise_only: bool = False
     ev_epsilon: float = 1e-9
     # --- fallback ---------------------------------------------------------

@@ -51,6 +51,8 @@ def official_settings(**overrides) -> Settings:
         postflop_eq_realization=2.5,     # strong hands realise more on flop/turn, weak less (see commit)
         split_bluff_decide=True, split_bluff_observe=True,   # value-only raisers (drew bots)
         cap_reraise_equity=True,
+        split_preflop_4bet=False,        # timesafe: keep 8b161e3 play; only the overhead scaling below is new
+        overhead_ref_cost=0.0015,        # contention: unseen overhead grows with our own slowdown
     )
     for k, v in overrides.items():
         if not hasattr(s, k):

@@ -54,6 +54,7 @@ class Spot:
     raises_this_street: int = 0
     integer_chips: bool = True
     preflop_pct: float = 0.5     # our hand's preflop percentile (preflop only)
+    opp_range_strength: float = 0.5   # posterior mean preflop percentile of their range (preflop only)
     raise_options: Optional[tuple] = None   # discrete raise-to totals, if the rules fix them
 
     @property
@@ -103,15 +104,20 @@ def realization(spot: Spot, settings, spr: float, street: Optional[int] = None) 
     if street == 0:
         depth = min(1.0, (min(spot.my_stack, spot.opp_stack) / max(spot.big_blind, 1e-9)) / 100.0)
         rho *= 1.0 + settings.preflop_score_realization * (spot.preflop_pct - 0.5) * depth
+        # against a range that has shown strength (3-bets, 4-bets) we realise less:
+        # it holds the hands that win the big postflop pots
+        rho *= 1.0 - settings.preflop_range_realization * max(0.0, spot.opp_range_strength - 0.5)
     return float(min(rho, 1.1))
 
 
-def opponent_context(spot: Spot) -> str:
+def opponent_context(spot: Spot, split_4bet: bool = False) -> str:
     """What the opponent faces after we raise."""
     if spot.street == 0:
         if spot.raises_this_street == 0:
             # preflop with nothing to call = we are the big blind after their limp
             return "limp_vs_raise" if spot.to_call <= 0 else "vs_raise"
+        if spot.raises_this_street >= 2 and split_4bet:
+            return "vs_4bet"
         return "vs_reraise"
     return "facing_bet" if spot.to_call == 0 and spot.raises_this_street == 0 else "facing_raise"
 
@@ -242,22 +248,45 @@ class DecisionEngine:
         self.equity = equity_engine
         self.model = model
         self.bands = bands      # preflop BandTable (exact preflop equity vs a range), optional
+        # online fold calibration: predicted (before scaling) vs actual folds to our postflop bets
+        self.fold_pred = 0.0
+        self.fold_act = 0.0
+
+    def fold_scale_now(self) -> float:
+        """Postflop fold-share multiplier: the fixed ``fold_scale``, or with
+        ``fold_calibrate`` that value as a prior updated by how often this opponent
+        actually folded vs how often the model said it would."""
+        s0 = self.s.fold_scale
+        if not self.s.fold_calibrate:
+            return s0
+        k = self.s.fold_calibrate_strength          # pseudo-bets at the prior scale
+        m = 0.35                                     # a typical predicted fold share
+        c = (self.fold_act + k * m * s0) / (self.fold_pred + k * m)
+        return float(min(self.s.fold_calibrate_max, max(self.s.fold_calibrate_min, c)))
+
+    def record_fold_outcome(self, predicted_raw: float, folded: bool) -> None:
+        self.fold_pred += float(predicted_raw)
+        self.fold_act += 1.0 if folded else 0.0
 
     # -------------------------------------------------------------- inputs
     def size_inputs(self, spot: Spot, rng_range, x: float) -> dict:
-        ctx = opponent_context(spot)
+        ctx = opponent_context(spot, self.s.split_preflop_4bet)
         a = x - spot.my_bet
         d = x - spot.opp_bet
         pot_after = spot.pot + a
         frac = d / max(pot_after - d, 1e-9)
         freqs = self.model.freqs(ctx, spot.street, frac)
-        if self.s.strength_fold_beta > 0 and hasattr(rng_range, "abs_strength_mean"):
+        if (self.s.strength_fold_beta > 0 and spot.street >= self.s.strength_fold_from_street
+                and hasattr(rng_range, "abs_strength_mean")):
             freqs = strength_adjust(freqs, rng_range.abs_strength_mean() - self.model.bet_strength(spot.street),
                                     self.s.strength_fold_beta)
         freqs = commitment_adjust(freqs, d / max(pot_after + d, 1e-9), self.s.commit_fold_ref)
-        if self.s.fold_scale != 1.0 and spot.street >= self.s.fold_scale_from_street:
+        p_fold_raw = float(freqs[FOLD_I])
+        scale = self.fold_scale_now() if spot.street >= self.s.fold_scale_from_street else 1.0
+        if scale != 1.0:
             freqs = np.asarray(freqs, dtype=float).copy()
-            moved = freqs[FOLD_I] * (1.0 - self.s.fold_scale)
+            moved = min(freqs[FOLD_I] * (1.0 - scale), freqs[PASSIVE_I] + freqs[FOLD_I]) if scale < 1.0 \
+                else -min(freqs[FOLD_I] * (scale - 1.0), freqs[PASSIVE_I])
             freqs[FOLD_I] -= moved
             freqs[PASSIVE_I] += moved
         bluff = self.model.bluff_share(ctx, split=True) if self.s.split_bluff_decide else self.model.bluff_share(ctx)
@@ -267,12 +296,14 @@ class DecisionEngine:
                                                self.model.call_informativeness())
                                            if (spot.street > 0 and self.s.split_informativeness) else None)}
         probs = rng_range.action_probs(freqs, **params)
-        return {"ctx": ctx, "frac": frac, "freqs": freqs,
+        return {"ctx": ctx, "frac": frac, "freqs": freqs, "p_fold_raw": p_fold_raw,
                 "q_call": probs[PASSIVE_I], "q_raise": probs[AGGR_I]}
 
     # -------------------------------------------------------------- decide
     def evaluate(self, spot: Spot, rng_range, n_samples: int, rng: np.random.Generator,
                  deadline: Optional[float] = None):
+        if spot.street == 0 and self.s.preflop_range_realization and hasattr(rng_range, "abs_strength_mean"):
+            spot.opp_range_strength = rng_range.abs_strength_mean()
         sizes = raise_sizes(spot, self.s.raise_fracs)
         if sizes and ((spot.street == 0 and self.s.preflop_max_raise_only)
                       or (spot.street > 0 and self.s.postflop_max_raise_only)):
@@ -306,6 +337,7 @@ class DecisionEngine:
             f = inp["freqs"]
             ev, info = ev_raise(spot, self.s, x, f[FOLD_I], f[PASSIVE_I], f[AGGR_I], eq_c, eq_r)
             info.update({"eq_call": eq_c, "eq_reraise": eq_r, "p_fold": float(f[FOLD_I]),
+                         "p_fold_raw": inp["p_fold_raw"],
                          "p_call": float(f[PASSIVE_I]), "p_raise": float(f[AGGR_I]),
                          "frac": inp["frac"]})
             options.append(Option(Action(RAISE, x), ev, info))

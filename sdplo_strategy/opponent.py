@@ -94,6 +94,7 @@ class Priors:
         "vs_raise": (0.30, 0.55, 0.15),
         "limp_vs_raise": (0.12, 0.70, 0.18),   # limpers rarely fold to a raise
         "vs_reraise": (0.30, 0.50, 0.20),
+        "vs_4bet": (0.15, 0.55, 0.30),          # used only with Settings.split_preflop_4bet
     })
     preflop_strength: float = 6.0
     facing_bet: tuple = (0.40, 0.48, 0.12)
@@ -149,6 +150,8 @@ class OpponentModel:
         # raises facing OUR bet are judged separately: semi-bluff bets and thin value
         # bets say nothing about how often a bot's raises are weak
         self.bluff_raise = Beta(pr.bluff_raise_share, pr.bluff_strength)
+        # bets on a turn/river that brought a scare card (scare-card bluffers)
+        self.bluff_scare = Beta(pr.bluff_share, pr.bluff_strength)
         self.showdown = {k: MeanStat(v, pr.showdown_strength)
                          for k, v in pr.showdown_strength_prior.items()}
         self.bet_size = {s: MeanStat(0.66, 2.0) for s in (1, 2, 3)}
@@ -245,9 +248,14 @@ class OpponentModel:
 
     def record_hand(self, points: Sequence[DecisionPoint], line: Optional[str] = None,
                     shown_strength: Optional[float] = None,
-                    shown_preflop_pct: Optional[float] = None) -> None:
+                    shown_preflop_pct: Optional[float] = None,
+                    scare_streets: Optional[set] = None) -> None:
         """Update every count from one finished hand."""
         self.hands += 1
+        if shown_strength is not None and scare_streets:
+            bets = [p for p in points if p.actor == OPP and p.kind == RAISE and p.context in ("lead", "checked_to")]
+            if any(p.street in scare_streets for p in bets):
+                self.bluff_scare.observe_bool(shown_strength < self.priors.weak_cutoff)
         opp_pre = [p for p in points if p.actor == OPP and p.street == 0]
         if shown_preflop_pct is not None and any(p.kind == RAISE for p in opp_pre):
             self.preflop_raise.observe(shown_preflop_pct)
@@ -302,6 +310,7 @@ class OpponentModel:
             "vs_reraise": [round(float(x), 3) for x in self.preflop["vs_reraise"].mean()],
             "bluff_share": round(self.bluff_share(), 3),
             "bluff_raise_share": round(self.bluff_raise.p, 3),
+            "bluff_scare_share": round(self.bluff_scare.p, 3),
             "informativeness": round(self.informativeness(), 3),
             "informativeness_preflop": round(self.informativeness(0), 3),
             "call_informativeness": round(self.call_informativeness(), 3),
