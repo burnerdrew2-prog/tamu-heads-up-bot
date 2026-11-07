@@ -71,6 +71,12 @@ _ND = NormalDist()
 CAT_W = (0.20, 0.40, 0.75, 0.95, 1.0, 1.0, 1.0, 1.0, 1.0)
 
 
+def _note(memory, text):
+    """Record the reason for a decision when explaining (tools/explain.py)."""
+    if memory.get("_explain") is not None:
+        memory["_explain"].append(text)
+
+
 def _action_name(a) -> str:
     return getattr(a, "name", str(a)).upper()
 
@@ -191,6 +197,8 @@ def _decide(obs, memory):
             eq_vs = 0.5 + 1.6 * (eq - max(t + 0.02, PRE_MEAN))
         else:
             eq_vs = eq
+        _note(memory, "preflop strength %.3f (median hand 0.50, top 15%% 0.575)%s; price %.2f"
+              % (eq, "; vs their raising range (they raise %.0f%% preflop) ~%.3f" % (100 * pf_rate, eq_vs) if pf_raises else "", need))
         if raises >= 2:
             if eq_vs >= 0.60:
                 return _pick(obs, [Action.RAISE_POT, Action.CHECK_CALL])
@@ -217,6 +225,9 @@ def _decide(obs, memory):
     else:
         eq = preflop_equity(obs.hole_cards)
     in_pos = button          # the button acts last after the flop
+    _note(memory, "equity %.2f from %d samples%s; price %.2f; %s; they fold to our raises %.0f%%"
+          % (eq, n, (" weighted by their %d preflop + %d postflop raise(s)" % (pf_raises, post_raises)) if (pf_raises or post_raises) else " vs any hand",
+             need, "in position" if in_pos else "out of position", 100 * fold_rate))
     if to_call == 0:
         if eq >= 0.72:
             return _pick(obs, [Action.RAISE_POT, Action.RAISE_HALF])
