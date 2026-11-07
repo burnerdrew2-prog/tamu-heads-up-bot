@@ -50,6 +50,10 @@ class Settings:
     preflop_max_raise_only: bool = False   # preflop, consider only the largest legal raise
     fold_scale: float = 1.0           # multiply the predicted fold share of our bets (1 = off)
     postflop_eq_realization: float = 0.0  # flop/turn realization slope by equity (0 = off)
+    rz_on_call: bool = True           # apply the slope when pricing a call too
+    split_bluff_decide: bool = False  # their re-raise range uses the raise-specific bluff share
+    split_bluff_observe: bool = False # ... and so does the range update after their raises
+    cap_reraise_equity: bool = False  # equity vs their re-raising range <= vs their calling range
     rz_min: float = 0.5               # ... clipped to [rz_min, rz_max]
     rz_max: float = 1.5
     fold_scale_from_street: int = 1   # ... on this street and later

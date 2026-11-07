@@ -138,7 +138,8 @@ def ev_call(spot, settings, eq) -> float:
     pot = spot.pot - returned + c
     left = min(spot.my_stack - c, spot.opp_stack)
     spr = left / max(pot, 1e-9)
-    return realization(spot, settings, spr) * strength_rz(spot, settings, spr, eq) * eq * pot - c
+    rz = strength_rz(spot, settings, spr, eq) if settings.rz_on_call else 1.0
+    return realization(spot, settings, spr) * rz * eq * pot - c
 
 
 def ev_raise(spot, settings, x, p_fold, p_call, p_raise, eq_call, eq_reraise) -> tuple:
@@ -259,7 +260,8 @@ class DecisionEngine:
             moved = freqs[FOLD_I] * (1.0 - self.s.fold_scale)
             freqs[FOLD_I] -= moved
             freqs[PASSIVE_I] += moved
-        params = {"bluff_share": self.model.bluff_share(ctx) * (0.5 if spot.street == 0 else 1.0),
+        bluff = self.model.bluff_share(ctx, split=True) if self.s.split_bluff_decide else self.model.bluff_share(ctx)
+        params = {"bluff_share": bluff * (0.5 if spot.street == 0 else 1.0),
                   "informativeness": self.model.informativeness(spot.street),
                   "call_informativeness": (max(self.model.informativeness(spot.street),
                                                self.model.call_informativeness())
@@ -299,6 +301,8 @@ class DecisionEngine:
             options.append(Option(Action(CHECK), ev_check(spot, self.s, base), {}))
         for k, (x, inp) in enumerate(zip(sizes, inputs)):
             eq_c, eq_r = subs[2 * k], subs[2 * k + 1]
+            if self.s.cap_reraise_equity:
+                eq_r = min(eq_r, eq_c)   # a re-raising range is no weaker than a calling one
             f = inp["freqs"]
             ev, info = ev_raise(spot, self.s, x, f[FOLD_I], f[PASSIVE_I], f[AGGR_I], eq_c, eq_r)
             info.update({"eq_call": eq_c, "eq_reraise": eq_r, "p_fold": float(f[FOLD_I]),

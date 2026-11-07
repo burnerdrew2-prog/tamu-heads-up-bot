@@ -40,7 +40,7 @@ warmup()
 
 # rename as your team/bot's name
 PARTICIPANT = "drew"
-AGENT_NAME = "sdplo_v1"
+AGENT_NAME = "sdplo_v2"
 
 
 # ===== YOUR CODE HERE =====

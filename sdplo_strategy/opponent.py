@@ -194,10 +194,11 @@ class OpponentModel:
     def observe_bet_strength(self, street: int, strength: float) -> None:
         self._bet_strength[street].observe(strength)
 
-    def bluff_share(self, context: Optional[str] = None) -> float:
+    def bluff_share(self, context: Optional[str] = None, split: Optional[bool] = None) -> float:
         """Weak share of the opponent's aggressive range: for raises facing a bet
         (``facing_bet`` / ``facing_raise``) its own estimate, else that of bets."""
-        if self.priors.split_bluff_share and context in ("facing_bet", "facing_raise"):
+        split = self.priors.split_bluff_share if split is None else split
+        if split and context in ("facing_bet", "facing_raise"):
             return self.bluff_raise.p
         return self.bluff.p
 

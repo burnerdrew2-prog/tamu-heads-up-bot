@@ -339,7 +339,10 @@ class StrategyBot:
         points, state = walk(obs.history, button, obs.small_blind, obs.big_blind)
         if abs(state.pot - obs.pot) > 1e-6:
             self.pot_mismatches += 1
-        bluff_of = self.model.bluff_share
+        split_obs = self.s.split_bluff_observe
+
+        def bluff_of(ctx):
+            return self.model.bluff_share(ctx, split=True) if split_obs else self.model.bluff_share(ctx)
         kappa = (self.model.informativeness(0), self.model.informativeness(1))
         # folds/calls are at least as strength-driven as bets (max: equity bots read 1.0
         # on aggression; a chart bot's semi-bluffs read lower than its folds)

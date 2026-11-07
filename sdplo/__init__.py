@@ -1,1 +1,1 @@
-"""Vendored from sdplo-bot @ b09ca3b: the fast numpy evaluator only."""
+"""Vendored from sdplo-bot @ 6c95ceb: the fast numpy evaluator only."""

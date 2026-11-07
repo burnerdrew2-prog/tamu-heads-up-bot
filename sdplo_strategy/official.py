@@ -44,11 +44,13 @@ def official_settings(**overrides) -> Settings:
         strength_runouts=1, sample_budget=80, preflop_budget_frac=0.5,
         time_limit=0.25, time_target_frac=0.6, hard_stop_frac=0.5,
         match_time_budget=DEFAULT_BANK, hands_per_match=1000,
-        request_grace=REQUEST_GRACE, request_overhead=0.0007, bank_reserve=2.0,
+        request_grace=REQUEST_GRACE, request_overhead=0.0007, bank_reserve=3.0,   # plan 5 s of 8
         cheap_below=0.0009, showdown_ref_hands=60, seed=20261108,
         preflop_score_realization=2.0,   # 3 seeds x 8 bots: +2.67 vs +2.38 bb/deal at 0.25
         fold_scale=0.8,                  # postflop fold-equity discount; 0.65 was +0.04 vs the field but -0.3 vs drew_v2
         postflop_eq_realization=2.5,     # strong hands realise more on flop/turn, weak less (see commit)
+        split_bluff_decide=True, split_bluff_observe=True,   # value-only raisers (drew bots)
+        cap_reraise_equity=True,
     )
     for k, v in overrides.items():
         if not hasattr(s, k):
