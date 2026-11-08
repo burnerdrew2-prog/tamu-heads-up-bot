@@ -104,6 +104,11 @@ class Settings:
     fold_calibrate_min: float = 0.4
     fold_calibrate_max: float = 1.4
     postflop_max_raise_only: bool = False
+    # preflop rules from the CFR preflop solve of this game (percentile = PreflopScorer; 0 = off)
+    pf_war_raise_min_pct: float = 0.0       # limped pot, facing a re-raise: raise only at pct >= this, else call
+    pf_3bet_raise_min_pct: float = 0.0      # button facing a 3-bet after opening: 4-bet only at pct >= this, else call
+    pf_open_fold_below: float = 0.0         # button first in: fold below this pct
+    pf_limp_raised_fold_below: float = 0.0  # button after limping, facing the BB's raise: fold below this pct
     ev_epsilon: float = 1e-9
     # --- fallback ---------------------------------------------------------
     cheap_call_pot_frac: float = 0.34   # call in fallback if to_call <= this * pot

@@ -87,6 +87,33 @@ def legalize(action: Action, obs: Observation, settings: Optional[Settings] = No
     return Action(RAISE, x)
 
 
+def preflop_rules_on(s: Settings) -> bool:
+    return (s.pf_war_raise_min_pct > 0 or s.pf_3bet_raise_min_pct > 0
+            or s.pf_open_fold_below > 0 or s.pf_limp_raised_fold_below > 0)
+
+
+def preflop_rule_action(s: Settings, history, hero_is_button: bool, pct: float, action: Action,
+                        to_call: float) -> Action:
+    """Override a preflop decision by the solver rules (Settings.pf_*); else ``action``."""
+    pre = [r for r in history if r.street == 0]
+    n_raise = sum(1 for r in pre if r.kind == RAISE)
+    if not pre:
+        if hero_is_button and to_call > 0 and pct < s.pf_open_fold_below:
+            return Action(FOLD)
+        return action
+    if pre[0].kind == CALL:                                  # the button limped
+        if (hero_is_button and len(pre) == 2 and pre[1].kind == RAISE and to_call > 0
+                and pct < s.pf_limp_raised_fold_below):
+            return Action(FOLD)
+        if n_raise >= 2 and to_call > 0 and action.kind == RAISE and pct < s.pf_war_raise_min_pct:
+            return Action(CALL)
+    elif pre[0].kind == RAISE:                               # the button opened
+        if (hero_is_button and len(pre) == 2 and n_raise == 2 and to_call > 0
+                and action.kind == RAISE and pct < s.pf_3bet_raise_min_pct):
+            return Action(CALL)
+    return action
+
+
 # ------------------------------------------------------------------ timing
 
 
@@ -521,10 +548,12 @@ class StrategyBot:
 
     def _act(self, obs: Observation, t0: float) -> Action:
         self._mode = self.s.force_mode or self.timer.mode(obs.hand_number)
-        if self._mode == "cheap" and self.s.cheap_version == 2:
-            return self._cheap_act_v2(obs)
         if self._mode == "cheap":
-            return self._cheap_act(obs)
+            a = self._cheap_act_v2(obs) if self.s.cheap_version == 2 else self._cheap_act(obs)
+            if obs.street == 0 and preflop_rules_on(self.s):
+                a = preflop_rule_action(self.s, obs.history, self._button(obs),
+                                        self.scorer.percentile(self.scorer.equity(obs.hole)), a, obs.to_call)
+            return a
         lite = self._mode == "lite"
         if (self.hand is None or self.hand.number != obs.hand_number
                 or self.hand.hole != tuple(obs.hole)):
@@ -629,7 +658,12 @@ class StrategyBot:
                 options = kept
         vr = self.value_rate.get(obs.street)
         opt, reason = self.engine.choose(spot, eq, options, self.rng, vr.p if vr else 0.3)
-        if opt.action.kind == RAISE:
+        action = opt.action
+        if obs.street == 0 and preflop_rules_on(self.s):
+            action = preflop_rule_action(self.s, obs.history, button, pre_pct, action, obs.to_call)
+            if action is not opt.action:
+                reason = "preflop_rule"
+        if opt.action.kind == RAISE and action is opt.action:
             # the conditions under which their response frequencies are learned
             if self.s.strength_fold_beta > 0 and not lite:
                 self.model.observe_bet_strength(obs.street, hs.range.abs_strength_mean())
@@ -644,7 +678,7 @@ class StrategyBot:
                                            round(o.info.get("p_fold", 0.0), 3), round(o.info.get("p_raise", 0.0), 3),
                                            round(o.info.get("eq_call", 0.0), 3), round(o.info.get("eq_reraise", 0.0), 3))
                                           for o in options]}
-        return opt.action
+        return action
 
     def _learn(self, history, hero_is_button, sb, bb, opp_hole, board, hero_hole) -> None:
         if hero_is_button is None:

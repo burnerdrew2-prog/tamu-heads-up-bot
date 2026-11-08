@@ -66,6 +66,14 @@ def official_settings(**overrides) -> Settings:
         # measurement): re-raise only with a full house or better; with eq_calibrate, vs
         # sdbot-full +0.303 bb/deal on 48 fresh seeds (801-874), field check clean
         raise_cap=True, raise_cap_streets=(1, 2, 3),
+        # preflop re-raise discipline (CFR preflop solve): with a coin-flip hand, call a
+        # re-raise instead of re-raising again. vs hybridX-v7 those re-raises lost 916 bb in
+        # 3,000 deals (150 deals) where it just called with the same cards. Thresholds from a
+        # 6-point grid on 5c7e645, two seed blocks each (sdbot-full 96 seeds, 55 bots x 4 seeds),
+        # paired vs v5: 0.8/0.8 sdbot +0.106 +- 0.046 (points 25 vs 23), field +0.085 +- 0.018,
+        # 0 WORSE flags; 0.9/0.8 +0.035 / +0.061. Tighter 3-bet thresholds (0.85, 0.9) flag
+        # hunter-sizemedium WORSE; 0.85/0.75 did not replicate vs sdbot.
+        pf_war_raise_min_pct=0.8, pf_3bet_raise_min_pct=0.8,
         split_preflop_4bet=False,        # timesafe: keep 8b161e3 play; only the overhead scaling below is new
         overhead_ref_cost=0.0015,        # contention: unseen overhead grows with our own slowdown
         lite_mode=False,
