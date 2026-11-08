@@ -269,20 +269,27 @@ class DecisionEngine:
         self.fold_act += 1.0 if folded else 0.0
 
     # -------------------------------------------------------------- inputs
-    def size_inputs(self, spot: Spot, rng_range, x: float) -> dict:
+    def size_inputs(self, spot: Spot, rng_range, x: float, lite: bool = False) -> dict:
         ctx = opponent_context(spot, self.s.split_preflop_4bet)
         a = x - spot.my_bet
         d = x - spot.opp_bet
         pot_after = spot.pot + a
         frac = d / max(pot_after - d, 1e-9)
+        if ctx == "vs_raise" and self.s.split_open_size and frac > 0.75:
+            ctx = "vs_raise_pot"
         freqs = self.model.freqs(ctx, spot.street, frac)
         if (self.s.strength_fold_beta > 0 and spot.street >= self.s.strength_fold_from_street
-                and hasattr(rng_range, "abs_strength_mean")):
+                and not lite and hasattr(rng_range, "abs_strength_mean")):
             freqs = strength_adjust(freqs, rng_range.abs_strength_mean() - self.model.bet_strength(spot.street),
                                     self.s.strength_fold_beta)
         freqs = commitment_adjust(freqs, d / max(pot_after + d, 1e-9), self.s.commit_fold_ref)
         p_fold_raw = float(freqs[FOLD_I])
         scale = self.fold_scale_now() if spot.street >= self.s.fold_scale_from_street else 1.0
+        if scale < 1.0 and spot.street > 0 and self.s.pot_pressure_gate_n > 0 and frac > 0.8:
+            # gated: trust the fold model on pot-size bets against a measured over-folder
+            pf, pn = self.model.pot_bet_fold_rate()
+            if pn >= self.s.pot_pressure_gate_n and pf / pn >= self.s.pot_pressure_gate_rate:
+                scale = 1.0
         if scale != 1.0:
             freqs = np.asarray(freqs, dtype=float).copy()
             moved = min(freqs[FOLD_I] * (1.0 - scale), freqs[PASSIVE_I] + freqs[FOLD_I]) if scale < 1.0 \
@@ -301,14 +308,14 @@ class DecisionEngine:
 
     # -------------------------------------------------------------- decide
     def evaluate(self, spot: Spot, rng_range, n_samples: int, rng: np.random.Generator,
-                 deadline: Optional[float] = None):
+                 deadline: Optional[float] = None, lite: bool = False):
         if spot.street == 0 and self.s.preflop_range_realization and hasattr(rng_range, "abs_strength_mean"):
             spot.opp_range_strength = rng_range.abs_strength_mean()
         sizes = raise_sizes(spot, self.s.raise_fracs)
         if sizes and ((spot.street == 0 and self.s.preflop_max_raise_only)
                       or (spot.street > 0 and self.s.postflop_max_raise_only)):
             sizes = sizes[-1:]
-        inputs = [self.size_inputs(spot, rng_range, x) for x in sizes]
+        inputs = [self.size_inputs(spot, rng_range, x, lite) for x in sizes]
         reweights, factors = [], []
         for inp in inputs:
             reweights += [inp["q_call"], inp["q_raise"]]

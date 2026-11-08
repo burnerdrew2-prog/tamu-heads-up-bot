@@ -9,6 +9,7 @@ from typing import Optional
 class Settings:
     # --- range tracking -------------------------------------------------
     range_size: int = 1500            # opponent hands in the weighted sample
+    range_top_up: bool = True         # refill to range_size when board cards remove hands
     ess_min_frac: float = 0.30        # refill when ESS < this * range_size
     refill_frac: float = 0.75         # fresh hands added on refill, * range_size
     max_range_size: int = 3500        # hard cap after refills
@@ -24,6 +25,7 @@ class Settings:
     hard_stop_frac: float = 0.7       # Monte Carlo stops at this share of the limit
     min_budget_scale: float = 0.05
     match_time_budget: Optional[float] = None  # total seconds per match, if the rules cap it
+    time_free_without_bank: bool = True   # no bank: no clock-dependent sample cuts or deadlines
     hands_per_match: int = 2000
     request_grace: float = 0.0        # seconds of each decision not charged to the bank
     request_overhead: float = 0.0     # charged time per decision we cannot see (server, JSON)
@@ -31,6 +33,19 @@ class Settings:
     cheap_below: float = 0.0          # per-decision allowance (s) under which the cheap path runs
     cheap_hint: float = 0.3           # with a bank: allowance / recent decision cost under which it runs
     overhead_ref_cost: float = 0.0    # >0: scale request_overhead by recent decision cost / this
+    split_open_size: bool = False     # preflop: their response to our pot-size open is its own context
+    pot_pressure_gate_n: int = 0      # >0: no fold discount on pot bets once they fold >= rate over n
+    pot_pressure_gate_rate: float = 0.55
+    lite_mode: bool = False           # tiered time control: full / lite / cheap per decision
+    contention_overhead: bool = False # scale request_overhead by measured wall/CPU of our work
+    cheap_version: int = 1            # 1 = original cheap path, 2 = model-aware cheap path
+    size_bluff_gate: int = 0          # >0: their bets use a bluff share by size and street group
+                                      #     once that many such bets were shown down
+    force_mode: str = ""              # testing: "cheap" / "lite" / "full" for every decision
+    load_overhead_slope: float = 0.0  # ... and by 1 + slope * (loadavg per CPU - knee), 1-4x
+    load_overhead_knee: float = 0.85
+    lite_range_size: int = 64         # lite: particles in a hand started in lite mode
+    lite_sample_frac: float = 0.5     # lite: share of the Monte Carlo budget
     # --- decisions ------------------------------------------------------
     raise_fracs: tuple = (1 / 3, 2 / 3, 1.0)   # fractions of the pot-limit raise
     realization_ip: float = 0.95

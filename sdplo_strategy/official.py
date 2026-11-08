@@ -30,6 +30,8 @@ from .preflop import band_table_for_ranking, table_for_ranking
 from .settings import Settings
 from .types import CALL, CHECK, FOLD, HERO, OPP, RAISE, Action, ActionRecord, HandResult, Observation
 
+_TIMELOG = os.environ.get("SDPLO_TIMELOG")   # debug: append time-bank records to this file
+
 # Rule assumptions from the official guide, kept in one place.
 OFFICIAL_RANKING = {"trips_beat_straight": True, "flush_beats_full_house": True}
 DEFAULT_BANK = 8.0          # seconds per half
@@ -44,7 +46,13 @@ def official_settings(**overrides) -> Settings:
         strength_runouts=1, sample_budget=80, preflop_budget_frac=0.5,
         time_limit=0.25, time_target_frac=0.6, hard_stop_frac=0.5,
         match_time_budget=DEFAULT_BANK, hands_per_match=1000,
-        request_grace=REQUEST_GRACE, request_overhead=0.0007, bank_reserve=3.0,   # plan 5 s of 8
+        # Time profile = fbdfc64 (plan 5 s of the 8 s bank, overhead scaled by our own
+        # slowdown); the real judge (dedicated 1-CPU pod) charged 1.31-1.36 ms per call
+        # and ~0.5-0.9 ms beyond our work, so 0.9 ms is a little insurance.
+        request_grace=REQUEST_GRACE, request_overhead=0.0009, bank_reserve=3.0,   # plan 5 s of 8
+        # Laptop-contention tools, off: tiers (lite_mode), wall/CPU and host-load overhead scaling.
+        contention_overhead=False, load_overhead_slope=0.0,
+        cheap_version=2,                 # model-aware cheap path (bank-off forced: +1.53 vs -0.01 bb/deal)
         cheap_below=0.0009, showdown_ref_hands=60, seed=20261108,
         preflop_score_realization=2.0,   # 3 seeds x 8 bots: +2.67 vs +2.38 bb/deal at 0.25
         fold_scale=0.8,                  # postflop fold-equity discount; 0.65 was +0.04 vs the field but -0.3 vs drew_v2
@@ -53,6 +61,7 @@ def official_settings(**overrides) -> Settings:
         cap_reraise_equity=True,
         split_preflop_4bet=False,        # timesafe: keep 8b161e3 play; only the overhead scaling below is new
         overhead_ref_cost=0.0015,        # contention: unseen overhead grows with our own slowdown
+        lite_mode=False,
     )
     for k, v in overrides.items():
         if not hasattr(s, k):
@@ -196,6 +205,7 @@ class OfficialAgent:
     # -------------------------------------------------------------- decide
     def choose(self, obs):
         t0 = time.perf_counter()
+        c0 = time.process_time()
         n_before = self.bot.timer.n
         try:
             o = to_observation(obs, self.small_blind)
@@ -208,12 +218,18 @@ class OfficialAgent:
             self.last_error = traceback.format_exc(limit=4)
             out = safe_action(obs)
         self._hand, self._obs, self._act = int(obs.hand_index), obs, out
-        full = time.perf_counter() - t0 + self._pending_end
+        wall = time.perf_counter() - t0
+        try:
+            self.bot.timer.observe_contention(wall, time.process_time() - c0)
+        except Exception:
+            pass
+        full = wall + self._pending_end
         self._pending_end = 0.0
         try:
             t = self.bot.timer
             if t.n > n_before:     # charge conversion + the result hooks of this request too
-                t.adjust(t.last_elapsed, full, cheap=self.bot._was_cheap)
+                t.adjust(t.last_elapsed, full, cheap=self.bot._was_cheap,
+                         mode="cheap" if self.bot._was_cheap else self.bot._mode)
         except Exception:
             pass
         self.decision_ms.append(1000 * full)
@@ -235,6 +251,24 @@ class OfficialAgent:
             self.last_error = traceback.format_exc(limit=4)
         self._obs = self._act = None
         self._pending_end += time.perf_counter() - t0
+        if _TIMELOG and (int(result.hand_index) + 1) % 250 == 0:
+            self._timelog(int(result.hand_index))
+
+    def _timelog(self, hand: int) -> None:
+        """Debug only (SDPLO_TIMELOG=<file>): our own view of the time bank."""
+        try:
+            import json
+            t = self.bot.timer
+            rec = {"hand": hand, "decisions": len(self.decision_ms),
+                   "wall_ms": round(sum(self.decision_ms), 1), "charged_est_s": round(t.total, 3),
+                   "cheap": t.cheap, "modes": dict(t.modes), "ema_ms": round(1000 * (t.ema_cost or 0), 3),
+                   "ema_lite_ms": round(1000 * (t.ema_lite or 0), 3), "load": round(t.load, 3),
+                   "contention": round(t.contention, 3), "load_factor": round(t.load_factor(), 3),
+                   "overhead_ms": round(1000 * t.overhead(), 3), "pid": os.getpid()}
+            with open(_TIMELOG, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass
 
     def _reconstruct(self, result):
         """Full action history of a finished hand from our last view of it."""

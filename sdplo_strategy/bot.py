@@ -112,7 +112,13 @@ class TimeKeeper:
         self.decisions_per_hand = 3.0
         self.last_hand = 0
         self.ema_cost = None    # recent full wall cost of a non-cheap decision
+        self.ema_lite = None    # recent wall cost of a lite decision (lite_mode)
+        self.load = 1.0         # recent cost / nominal cost of the mode used (lite_mode)
         self.last_elapsed = 0.0
+        self.modes = {"full": 0, "lite": 0, "cheap": 0}
+        self.contention = 1.0   # EMA of wall / CPU time of our own work (1 = a free core)
+        self._load_seen = None  # host load average per CPU, refreshed every 25 decisions
+        self._load_at = 0
 
     def overhead(self) -> float:
         """Per-request time we cannot see (server, JSON).  Under CPU contention it
@@ -120,9 +126,58 @@ class TimeKeeper:
         decisions run vs ``overhead_ref_cost`` (never below the base estimate)."""
         o = self.s.request_overhead
         ref = self.s.overhead_ref_cost
-        if ref > 0 and self.ema_cost:
+        if self.s.contention_overhead:
+            # the server's own parsing/JSON runs in our process and stretches like our
+            # decisions do when the core is shared or throttled; on an oversubscribed
+            # host most of the stretch is wake-up latency we cannot time, so the host's
+            # load per CPU is a second signal
+            return o * min(4.0, max(1.0, self.contention, self.load_factor()))
+        if self.s.lite_mode:
+            if ref > 0:
+                o *= min(3.0, max(1.0, self.load))
+        elif ref > 0 and self.ema_cost:
             o *= min(3.0, max(1.0, self.ema_cost / ref))
         return o
+
+    def load_factor(self) -> float:
+        k = self.s.load_overhead_slope
+        if k <= 0:
+            return 1.0
+        if self._load_seen is None or self.n - self._load_at >= 25:
+            try:
+                import os
+                self._load_seen = os.getloadavg()[0] / max(1, os.cpu_count() or 1)
+            except Exception:
+                self._load_seen = 0.0
+            self._load_at = self.n
+        return min(4.0, max(1.0, 1.0 + k * (self._load_seen - self.s.load_overhead_knee)))
+
+    def observe_contention(self, wall: float, cpu: float) -> None:
+        if cpu > 1e-4 and wall > 0:
+            r = min(6.0, max(0.8, wall / cpu))
+            self.contention = 0.9 * self.contention + 0.1 * r
+
+    def _nominal(self, mode: str) -> float:
+        ref = self.s.overhead_ref_cost or 0.0015
+        return {"full": ref, "lite": ref * 0.6, "cheap": ref * 0.2}[mode]
+
+    def mode(self, hand_number: int = 0) -> str:
+        """full / lite / cheap for this decision.  Without ``lite_mode`` this is the
+        old rule (cheap below cheap_hint, else full with scaled samples)."""
+        if not self.s.lite_mode:
+            return "cheap" if self.cheap_mode(hand_number) else "full"
+        if self.s.match_time_budget is None:
+            return "full"
+        if self.remaining() <= 0:
+            return "cheap"
+        allow = self.limit(hand_number)
+        ef = self.ema_cost or self._nominal("full")
+        el = self.ema_lite or 0.6 * ef
+        if allow >= ef:
+            return "full"
+        if allow >= el:
+            return "lite"
+        return "cheap"
 
     def charge(self, elapsed: float) -> float:
         return max(0.0, elapsed + self.overhead() - self.s.request_grace)
@@ -157,9 +212,15 @@ class TimeKeeper:
     def budget(self, base: int, hand_number: int = 0) -> int:
         if self.s.match_time_budget is not None:
             return max(16, int(base * self.hint(hand_number)))
+        if self.s.time_free_without_bank:
+            return max(16, int(base))       # no bank (tests, sweeps): never depend on the clock
         return max(16, int(base * self.scale))
 
-    def record(self, elapsed: float, hand_number: int = 0, cheap: bool = False) -> None:
+    def record(self, elapsed: float, hand_number: int = 0, cheap: bool = False,
+               mode: Optional[str] = None) -> None:
+        if self.s.lite_mode and mode is not None:
+            self._record_tiered(elapsed, hand_number, mode)
+            return
         self.n += 1
         self.last_elapsed = elapsed
         self.wall += elapsed
@@ -181,6 +242,36 @@ class TimeKeeper:
         elif elapsed < 0.5 * target:
             self.scale = min(1.0, self.scale * 1.1)
 
+    def _record_tiered(self, elapsed: float, hand_number: int, mode: str) -> None:
+        self.n += 1
+        self.modes[mode] = self.modes.get(mode, 0) + 1
+        self.last_elapsed = elapsed
+        self.wall += elapsed
+        self.total += self.charge(elapsed)
+        self.max = max(self.max, elapsed)
+        self.last_hand = max(self.last_hand, hand_number)
+        if self.n >= 30:
+            self.decisions_per_hand = min(6.0, max(1.5, self.n / (self.last_hand + 1)))
+        self._ema_update(mode, elapsed)
+        self.load = 0.95 * self.load + 0.05 * min(4.0, max(0.3, elapsed / self._nominal(mode)))
+
+    def _ema_update(self, mode: str, x: float) -> None:
+        a = 0.05
+        if mode == "full":
+            self.ema_cost = x if self.ema_cost is None else (1 - a) * self.ema_cost + a * min(x, 3.0 * self.ema_cost)
+            if self.ema_lite is not None:
+                self.ema_lite *= 1.0
+        elif mode == "lite":
+            self.ema_lite = x if self.ema_lite is None else (1 - a) * self.ema_lite + a * min(x, 3.0 * self.ema_lite)
+            if self.ema_cost is not None:
+                self.ema_cost *= 0.995      # retry full now and then
+        else:
+            # slow decay so the tiers are retried now and then, never below half nominal
+            if self.ema_cost is not None:
+                self.ema_cost = max(0.5 * self._nominal("full"), self.ema_cost * 0.995)
+            if self.ema_lite is not None:
+                self.ema_lite = max(0.5 * self._nominal("lite"), self.ema_lite * 0.99)
+
     def _update_cost(self, elapsed: float) -> None:
         a = 0.05
         if self.ema_cost is None:
@@ -189,7 +280,7 @@ class TimeKeeper:
         # robust: one slow outlier moves the estimate by at most a * 3 * ema
         self.ema_cost = (1 - a) * self.ema_cost + a * min(elapsed, 3.0 * self.ema_cost)
 
-    def adjust(self, inner: float, full: float, cheap: bool = False) -> None:
+    def adjust(self, inner: float, full: float, cheap: bool = False, mode: Optional[str] = None) -> None:
         """The caller measured more work for this decision than act() saw (format
         conversion, result hooks delivered with the request): charge the rest."""
         if full <= inner:
@@ -197,6 +288,12 @@ class TimeKeeper:
         self.total += self.charge(full) - self.charge(inner)
         self.wall += full - inner
         self.max = max(self.max, full)
+        if self.s.lite_mode and mode is not None:
+            if mode == "full" and self.ema_cost is not None:
+                self.ema_cost += 0.05 * min(full - inner, 3.0 * self.ema_cost)
+            elif mode == "lite" and self.ema_lite is not None:
+                self.ema_lite += 0.05 * min(full - inner, 3.0 * self.ema_lite)
+            return
         if not cheap and self.ema_cost is not None:
             self.ema_cost += 0.05 * min(full - inner, 3.0 * self.ema_cost)
 
@@ -244,6 +341,7 @@ class StrategyBot:
         self.last_decision: dict = {}
         self._was_cheap = False
         self._pending_bets: list = []     # (hand number, model's raw fold share) for our postflop bets
+        self._mode = "full"               # time tier of the current decision (full / lite / cheap)
 
     # -------------------------------------------------------------- public
     def act(self, obs: Observation, rng: Optional[np.random.Generator] = None) -> Action:
@@ -251,6 +349,7 @@ class StrategyBot:
         seeds one from the situation so mirrored duplicate hands match)."""
         t0 = time.perf_counter()
         self._was_cheap = False
+        self._mode = "full"
         if rng is not None:
             self.rng = rng
         try:
@@ -266,7 +365,7 @@ class StrategyBot:
             self.errors += 1
             action = Action(CHECK) if getattr(obs, "to_call", 1) <= 0 else Action(FOLD)
         self.timer.record(time.perf_counter() - t0, getattr(obs, "hand_number", 0) or 0,
-                          cheap=self._was_cheap)
+                          cheap=self._was_cheap, mode=("cheap" if self._was_cheap else self._mode))
         return action
 
     def on_hand_result(self, result: HandResult) -> None:
@@ -303,11 +402,14 @@ class StrategyBot:
                 self.errors += 1
         size = self.s.range_size
         runouts = self.s.strength_runouts
-        if self.s.match_time_budget is not None:
+        if self.s.lite_mode:
+            if self._mode != "full":
+                size = min(size, self.s.lite_range_size)
+        elif self.s.match_time_budget is not None:
             h = self.timer.hint(obs.hand_number)
             if h < 1.0:
                 size = max(48, int(size * max(0.35, h)))
-        elif self.timer.scale < 0.3:
+        elif self.timer.scale < 0.3 and not self.s.time_free_without_bank:
             size = max(200, int(size * max(0.25, 2 * self.timer.scale)))
             runouts = 1
         rt = RangeTracker(obs.hole, self.s, self.rng, self.evaluate, self.scorer,
@@ -337,18 +439,83 @@ class StrategyBot:
         need = obs.to_call / max(obs.pot + obs.to_call, 1e-9)
         return Action(CALL) if eq >= need + 0.05 else Action(FOLD)
 
+    def _cheap_act_v2(self, obs: Observation) -> Action:
+        """Cheap path, v2 (~0.3 ms): preflop table equity priced against the range the
+        opponent's raise frequency implies (band table), postflop a small Monte Carlo
+        vs random hands shifted by their aggression this street; value bets and
+        gated bluffs from the opponent model's fold rates.  No range tracking."""
+        self.timer.cheap += 1
+        self._was_cheap = True
+        st = obs.street
+        hist = obs.history
+        raises_st = sum(1 for r in hist if r.street == st and r.kind == RAISE)
+        opp_aggr = any(r.actor == OPP and r.kind == RAISE and r.street == st for r in hist)
+        need = obs.to_call / max(obs.pot + obs.to_call, 1e-9) if obs.to_call > 0 else 0.0
+        opts = sorted(o for o in (obs.raise_options or (obs.max_raise_to,)) if o is not None) \
+            if obs.can_raise else []
+        big = opts[-1] if opts else None
+        small = opts[0] if opts else None
+        if st == 0:
+            eq = self.scorer.equity(obs.hole)
+            pct = self.scorer.percentile(eq)
+            if raises_st == 0:
+                if obs.to_call > 0:                       # button, first in
+                    if pct >= 0.5 and big is not None:
+                        return Action(RAISE, big)
+                    return Action(CALL) if pct >= 0.15 else Action(FOLD)
+                if pct >= 0.7 and big is not None:        # big blind after a limp
+                    return Action(RAISE, big)
+                return Action(CHECK)
+            q = min(0.9, max(0.05, self.model.pfr.p * (0.5 ** (raises_st - 1))))
+            eq_vs = eq - 0.25 * (1.0 - q)
+            bands = self.engine.bands
+            if bands is not None:
+                row = bands.row(obs.hole)
+                if row is not None:
+                    k = max(1, min(len(row), int(round(q * len(row)))))
+                    eq_vs = float(np.mean(row[len(row) - k:]))
+            if eq_vs >= 0.6 and big is not None:
+                return Action(RAISE, big)
+            if obs.to_call <= 0:
+                return Action(CHECK)
+            return Action(CALL) if eq_vs * 0.92 >= need else Action(FOLD)
+        avail = remaining_deck(tuple(obs.hole) + tuple(obs.board))
+        opp = random_hands(self.rng, avail, 48)
+        _, out = self.equity.outcomes_fn(obs.hole, obs.board, opp, np.ones(len(opp)), 48, self.rng) \
+            if self.equity.outcomes_fn is not None else (None, np.array([0.5]))
+        eq = float(np.mean(out)) if len(out) else 0.5
+        if opp_aggr:
+            eq -= 0.15 * self.model.informativeness(st)
+        if obs.to_call > 0:
+            if eq >= 0.80 and big is not None:
+                return Action(RAISE, big)
+            return Action(CALL) if eq >= need + 0.04 else Action(FOLD)
+        ftb = self.model.fold_to_bet(st, 1.0)
+        if eq >= 0.66 and big is not None:
+            return Action(RAISE, big)
+        if eq >= 0.55 and small is not None and ftb < 0.3:
+            return Action(RAISE, small)               # thin value against callers
+        if eq < 0.35 and big is not None and ftb >= 0.55 and st < 3 and self.rng.random() < 0.6:
+            return Action(RAISE, big)                 # bluff an over-folder
+        return Action(CHECK)
+
     def _act(self, obs: Observation, t0: float) -> Action:
-        if self.timer.cheap_mode(obs.hand_number):
+        self._mode = self.s.force_mode or self.timer.mode(obs.hand_number)
+        if self._mode == "cheap" and self.s.cheap_version == 2:
+            return self._cheap_act_v2(obs)
+        if self._mode == "cheap":
             return self._cheap_act(obs)
+        lite = self._mode == "lite"
         if (self.hand is None or self.hand.number != obs.hand_number
                 or self.hand.hole != tuple(obs.hole)):
             self.hand = self._start_hand(obs)
         hs = self.hand
         hs.last_obs = obs
         hs.range.rng = self.rng
+        hs.range.top_up_enabled = not lite
         button = self._button(obs)
         points, state = walk(obs.history, button, obs.small_blind, obs.big_blind,
-                             split_4bet=self.s.split_preflop_4bet)
+                             split_4bet=self.s.split_preflop_4bet, split_open_size=self.s.split_open_size)
         if abs(state.pot - obs.pot) > 1e-6:
             self.pot_mismatches += 1
         split_obs = self.s.split_bluff_observe
@@ -367,8 +534,14 @@ class StrategyBot:
                 continue
             hs.range.set_board(obs.board[:BOARD_LEN[p.street]])
             freqs = self.model.freqs(p.context, p.street, p.frac)
+            bshare = bluff_of(p.context, p.street) * (0.5 if p.street == 0 else 1.0)
+            if (self.s.size_bluff_gate > 0 and p.kind == RAISE and p.street > 0
+                    and p.context in ("lead", "checked_to")):
+                sb = self.model.size_bluff_share(p.size_frac, p.street, self.s.size_bluff_gate)
+                if sb is not None:
+                    bshare = sb
             hs.range.observe(outcome_index(p.kind), freqs,
-                             bluff_share=bluff_of(p.context, p.street) * (0.5 if p.street == 0 else 1.0),
+                             bluff_share=bshare,
                              informativeness=kappa[0] if p.street == 0 else kappa[1],
                              call_informativeness=None if p.street == 0 else kappa_call)
         hs.points_seen = len(points)
@@ -391,14 +564,21 @@ class StrategyBot:
                     integer_chips=integer_chips(obs), preflop_pct=pre_pct,
                     raise_options=obs.raise_options)
         base = self.s.sample_budget * (self.s.preflop_budget_frac if obs.street == 0 else 1.0)
-        n = self.timer.budget(int(base), obs.hand_number)
-        deadline = t0 + self.timer.limit(obs.hand_number) * self.s.hard_stop_frac
-        eq, options, used = self.engine.evaluate(spot, hs.range, n, self.rng, deadline)
+        if self.s.lite_mode:
+            n = max(16, int(base * (self.s.lite_sample_frac if lite else 1.0)))
+            deadline = t0 + self.s.time_limit * self.s.hard_stop_frac
+        else:
+            n = self.timer.budget(int(base), obs.hand_number)
+            deadline = t0 + self.timer.limit(obs.hand_number) * self.s.hard_stop_frac
+            if self.s.match_time_budget is None and self.s.time_free_without_bank:
+                deadline = None
+        eq, options, used = self.engine.evaluate(spot, hs.range, n, self.rng, deadline, lite=lite)
         vr = self.value_rate.get(obs.street)
         opt, reason = self.engine.choose(spot, eq, options, self.rng, vr.p if vr else 0.3)
         if opt.action.kind == RAISE:
             # the conditions under which their response frequencies are learned
-            self.model.observe_bet_strength(obs.street, hs.range.abs_strength_mean())
+            if self.s.strength_fold_beta > 0 and not lite:
+                self.model.observe_bet_strength(obs.street, hs.range.abs_strength_mean())
             if obs.street > 0 and "p_fold_raw" in opt.info:
                 self._pending_bets.append((obs.hand_number, float(opt.info["p_fold_raw"])))
         if vr is not None and any(o.action.kind == RAISE for o in options):
@@ -417,7 +597,8 @@ class StrategyBot:
             hero_is_button = infer_button(history)
             if hero_is_button is None:
                 return
-        points, _ = walk(history, hero_is_button, sb, bb, split_4bet=self.s.split_preflop_4bet)
+        points, _ = walk(history, hero_is_button, sb, bb, split_4bet=self.s.split_preflop_4bet,
+                         split_open_size=self.s.split_open_size)
         line = opponent_line(points)
         self._settle_bets(points)
         shown = shown_pre = None

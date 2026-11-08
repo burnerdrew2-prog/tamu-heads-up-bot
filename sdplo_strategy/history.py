@@ -66,7 +66,7 @@ class WalkState:
 
 
 def walk(history: Sequence[ActionRecord], hero_is_button: bool, sb: float, bb: float,
-         split_4bet: bool = False):
+         split_4bet: bool = False, split_open_size: bool = False):
     """Return (points, final_state)."""
     button = HERO if hero_is_button else OPP
     big = 1 - button
@@ -95,6 +95,10 @@ def walk(history: Sequence[ActionRecord], hero_is_button: bool, sb: float, bb: f
             elif raises == 1:
                 # facing the first raise: after limping (already in voluntarily) or as an open
                 ctx = "limp_vs_raise" if a in acted else "vs_raise"
+                if ctx == "vs_raise" and split_open_size:
+                    before = pot - to_call
+                    if before > 0 and to_call / before > 0.75:
+                        ctx = "vs_raise_pot"     # a pot-size open (some bots fold far more)
             elif raises == 2 or not split_4bet:
                 ctx = "vs_reraise"
             else:

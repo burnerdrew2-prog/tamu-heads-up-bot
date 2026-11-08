@@ -95,6 +95,7 @@ class Priors:
         "limp_vs_raise": (0.12, 0.70, 0.18),   # limpers rarely fold to a raise
         "vs_reraise": (0.30, 0.50, 0.20),
         "vs_4bet": (0.15, 0.55, 0.30),          # used only with Settings.split_preflop_4bet
+        "vs_raise_pot": (0.30, 0.55, 0.15),     # used only with Settings.split_open_size
     })
     preflop_strength: float = 6.0
     facing_bet: tuple = (0.40, 0.48, 0.12)
@@ -152,6 +153,10 @@ class OpponentModel:
         self.bluff_raise = Beta(pr.bluff_raise_share, pr.bluff_strength)
         # bets on a turn/river that brought a scare card (scare-card bluffers)
         self.bluff_scare = Beta(pr.bluff_share, pr.bluff_strength)
+        # bets by size (pot-ish vs half-ish) and street group (river vs flop/turn):
+        # many bots size by strength (pot = value) or bluff with one size
+        self.bluff_size = {(big, river): Beta(pr.bluff_share, pr.bluff_strength)
+                           for big in (False, True) for river in (False, True)}
         self.showdown = {k: MeanStat(v, pr.showdown_strength)
                          for k, v in pr.showdown_strength_prior.items()}
         self.bet_size = {s: MeanStat(0.66, 2.0) for s in (1, 2, 3)}
@@ -184,12 +189,27 @@ class OpponentModel:
     def fold_to_bet(self, street: int, frac: float) -> float:
         return float(self.facing_bet_freqs(street, frac)[FOLD_I])
 
+    def size_bluff_share(self, size_frac: float, street: int, gate: int) -> Optional[float]:
+        """Bluff share of their bets of this size class on this street group, once at
+        least ``gate`` such bets were shown down; else None."""
+        b = self.bluff_size[(size_frac >= 0.75, street == 3)]
+        return b.p if gate > 0 and b.n >= gate else None
+
     def call_informativeness(self) -> float:
         """How much their calling (vs folding) tracks strength: shown hands that
         called postflop bets vs a random hand.  ~0 for a calling station."""
         exp = self.priors.call_strength_prior - 0.5
         got = self.call_strength.mean - 0.5
         return float(np.clip(got / exp, 0.05, 1.0)) if exp > 0 else 1.0
+
+    def pot_bet_fold_rate(self):
+        """(folds, decisions) of the opponent facing our postflop pot-size bets."""
+        n = f = 0.0
+        for st in (1, 2, 3):
+            c = self.fb_cell[(st, 2)].counts
+            n += float(c.sum())
+            f += float(c[FOLD_I])
+        return f, n
 
     def bet_strength(self, street: int) -> float:
         return self._bet_strength[street].mean
@@ -252,6 +272,13 @@ class OpponentModel:
                     scare_streets: Optional[set] = None) -> None:
         """Update every count from one finished hand."""
         self.hands += 1
+        if shown_strength is not None:
+            bets = [p for p in points if p.actor == OPP and p.kind == RAISE and p.street > 0
+                    and p.context in ("lead", "checked_to")]
+            if bets:
+                last = bets[-1]
+                self.bluff_size[(last.size_frac >= 0.75, last.street == 3)].observe_bool(
+                    shown_strength < self.priors.weak_cutoff)
         if shown_strength is not None and scare_streets:
             bets = [p for p in points if p.actor == OPP and p.kind == RAISE and p.context in ("lead", "checked_to")]
             if any(p.street in scare_streets for p in bets):

@@ -32,7 +32,9 @@ def eval_many(evaluate, evaluate_batch, hands: np.ndarray, board: tuple) -> np.n
     hands = np.asarray(hands)
     out = np.full(len(hands), np.nan)
     b = np.array(board, dtype=np.int16)
-    ok = ~np.isin(hands, b).any(axis=1)
+    mark = np.zeros(36, dtype=bool)          # faster than np.isin for 36 cards
+    mark[b] = True
+    ok = ~mark[hands].any(axis=1)
     if not ok.any():
         return out
     if evaluate_batch is not None:
@@ -150,7 +152,7 @@ class RangeTracker:
         self.street = STREET_OF_BOARD_LEN[len(board)]
         if self.weights.sum() <= 0:
             self._reset_uniform()
-        else:
+        elif getattr(self.s, "range_top_up", True) and getattr(self, "top_up_enabled", True):
             self._top_up()
         self._compute_street_strength()
         self._renorm()
@@ -198,15 +200,17 @@ class RangeTracker:
             m = max(1, self.runouts)
             runouts = [tuple(int(c) for c in self.rng.choice(avail, size=need, replace=False))
                        for _ in range(m)]
-        cols, cdfs = [], []
+        cols, cdfs, all_vals = [], [], []
         for ro in runouts:
             vals = eval_many(self.evaluate, self.evaluate_batch, self.hands, self.board + ro)
+            all_vals.append(vals)
             ok = ~np.isnan(vals)
             pct = np.full(len(vals), np.nan)
             if ok.any():
                 pct[ok] = weighted_percentile(vals[ok], self.weights[ok])
             cols.append(pct)
             cdfs.append(StrengthCDF(vals[ok], self.weights[ok]))
+        self._street_vals = (self.street, self._hands_ver, all_vals)   # reused by abs_strength
         self.raw = _nanmean_cols(cols)
         self.street_strength[self.street] = StreetStrength(self.board, runouts, cdfs)
         self._pct = None
@@ -219,14 +223,18 @@ class RangeTracker:
         if getattr(self, "_abs_key", None) == key:
             return self._abs
         if self.street == 0 or self.street not in self.street_strength:
-            out = self.scorer.percentiles(self.scorer.equities(self.hands)) if self.street == 0 \
+            # preflop, raw holds exactly scorer.equities(hands)
+            out = self.scorer.percentiles(self.raw) if self.street == 0 \
                 else np.full(len(self.hands), 0.5)
         else:
             ss = self.street_strength[self.street]
             cols = []
             ones = np.ones(len(self.hands))
-            for ro in ss.runouts:
-                vals = eval_many(self.evaluate, self.evaluate_batch, self.hands, self.board + ro)
+            sv = getattr(self, "_street_vals", None)
+            cached = sv[2] if (sv is not None and sv[0] == self.street and sv[1] == self._hands_ver) else None
+            for i, ro in enumerate(ss.runouts):
+                vals = cached[i] if cached is not None else \
+                    eval_many(self.evaluate, self.evaluate_batch, self.hands, self.board + ro)
                 ok = ~np.isnan(vals)
                 pct = np.full(len(vals), np.nan)
                 if ok.any():
