@@ -59,10 +59,26 @@ def official_settings(**overrides) -> Settings:
         postflop_eq_realization=2.5,     # strong hands realise more on flop/turn, weak less (see commit)
         split_bluff_decide=True, split_bluff_observe=True,   # value-only raisers (drew bots)
         cap_reraise_equity=True,
+        # facing a raise of our flop/turn bet: subtract the measured overestimate of our
+        # equity (shown hands); vs sdbot-full +0.215 +- 0.058 bb/deal on 48 fresh seeds
+        eq_calibrate=True,
+        # facing a raise of our postflop bet, once their raises proved value-heavy (the same
+        # measurement): re-raise only with a full house or better; with eq_calibrate, vs
+        # sdbot-full +0.303 bb/deal on 48 fresh seeds (801-874), field check clean
+        raise_cap=True, raise_cap_streets=(1, 2, 3),
         split_preflop_4bet=False,        # timesafe: keep 8b161e3 play; only the overhead scaling below is new
         overhead_ref_cost=0.0015,        # contention: unseen overhead grows with our own slowdown
         lite_mode=False,
     )
+    env = os.environ.get("SDPLO_SETTINGS")   # testing only: JSON overrides for scrimmage variants
+    if env:
+        try:
+            import json
+            for k, v in json.loads(env).items():
+                if hasattr(s, k):
+                    setattr(s, k, tuple(v) if isinstance(v, list) else v)
+        except Exception:
+            pass
     for k, v in overrides.items():
         if not hasattr(s, k):
             raise TypeError(f"unknown setting {k!r}")

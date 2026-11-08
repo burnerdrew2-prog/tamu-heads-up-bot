@@ -280,8 +280,15 @@ class RangeTracker:
         params.setdefault("floor", self.s.likelihood_floor)
         return action_probs(self.percentiles(), freqs, weights=self.weights, **params)
 
-    def observe(self, outcome: int, freqs, **params) -> None:
-        """Bayes update for one opponent action (outcome: 0 fold, 1 passive, 2 aggressive)."""
+    def observe(self, outcome: int, freqs, tilt=None, **params) -> None:
+        """Bayes update for one opponent action (outcome: 0 fold, 1 passive, 2 aggressive).
+
+        ``tilt`` (preflop only): (sum, n, prior_n, margin) of the preflop percentile
+        of hands they showed after this action in this context.  When that measured
+        mean (shrunk toward the model's own posterior mean with prior_n hands) is
+        above the posterior mean by more than margin, the likelihood is tilted by
+        exp(lam * (range percentile - 1)), lam chosen so the posterior mean preflop
+        percentile matches it (never loosens the range)."""
         params.setdefault("width", self.s.smooth_width)
         params.setdefault("floor", self.s.likelihood_floor)
         live = self.weights > 0
@@ -292,6 +299,10 @@ class RangeTracker:
         pct_all = np.concatenate([self.percentiles(), GRID])
         w_all = np.concatenate([self.weights, np.zeros(len(GRID))])
         probs = action_probs(pct_all, freqs, weights=w_all, **params)[outcome]
+        if tilt is not None and self.street == 0:
+            lam = self._tilt_lambda(probs[:n], pct_all[:n], tilt)
+            if lam > 0:
+                probs = probs * np.exp(lam * (pct_all - 1.0))
         lik = probs[:n]
         self.records.append(Record(self.street, cdf, probs[n:].copy()))
         self.weights = self.weights * lik
@@ -299,6 +310,34 @@ class RangeTracker:
             self.weights = np.ones(len(self.weights))
         self._renorm()
         self.maybe_refill()
+
+    def _tilt_lambda(self, lik: np.ndarray, pct: np.ndarray, tilt) -> float:
+        total, n_shown, prior_n, margin = tilt
+        a = self.abs_strength()                  # preflop: percentile among random hands
+        w0 = self.weights * lik
+        t0 = float(w0.sum())
+        if t0 <= 0 or n_shown <= 0:
+            return 0.0
+        mu0 = float((w0 * a).sum() / t0)
+        target = (float(total) + prior_n * mu0) / (n_shown + prior_n)
+        if target <= mu0 + margin:
+            return 0.0
+
+        def mean_at(lam):
+            w = w0 * np.exp(lam * (pct - 1.0))
+            t = float(w.sum())
+            return float((w * a).sum() / t) if t > 0 else mu0
+        hi = 40.0
+        if mean_at(hi) <= target:
+            return hi
+        lo = 0.0
+        for _ in range(30):
+            mid = 0.5 * (lo + hi)
+            if mean_at(mid) < target:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
 
     # ------------------------------------------------------------ refill
     def maybe_refill(self) -> bool:

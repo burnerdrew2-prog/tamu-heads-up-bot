@@ -56,6 +56,7 @@ class Spot:
     preflop_pct: float = 0.5     # our hand's preflop percentile (preflop only)
     opp_range_strength: float = 0.5   # posterior mean preflop percentile of their range (preflop only)
     raise_options: Optional[tuple] = None   # discrete raise-to totals, if the rules fix them
+    eq_shift: float = 0.0        # subtracted from every range equity (Settings.eq_calibrate)
 
     @property
     def can_raise(self) -> bool:
@@ -251,6 +252,7 @@ class DecisionEngine:
         # online fold calibration: predicted (before scaling) vs actual folds to our postflop bets
         self.fold_pred = 0.0
         self.fold_act = 0.0
+        self.last_raw_eq = 0.5
 
     def fold_scale_now(self) -> float:
         """Postflop fold-share multiplier: the fixed ``fold_scale``, or with
@@ -331,6 +333,12 @@ class DecisionEngine:
             base, subs, used = self.equity.estimate(
                 spot.hole, spot.board, rng_range.hands, rng_range.weights, reweights,
                 n_samples, rng, deadline=deadline, prior_factors=factors)
+        self.last_raw_eq = float(base)
+        if spot.eq_shift > 0:
+            # measured overestimate of our equity in this spot (shown hands): every
+            # equity vs their range (and its calling / re-raising parts) drops by it
+            base = max(0.0, base - spot.eq_shift)
+            subs = [max(0.0, x - spot.eq_shift) for x in subs]
         options: List[Option] = []
         if spot.to_call > 0:
             options.append(Option(Action(FOLD), 0.0, {}))

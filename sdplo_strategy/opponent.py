@@ -24,6 +24,24 @@ FOLD_I, PASSIVE_I, AGGR_I = 0, 1, 2
 UNOPENED = ("lead", "checked_to", "bb_option")
 
 
+POT_SIZE = 0.75   # a raise whose increment over the call is >= this * pot after the call is "pot-size"
+
+
+def size_group(p: DecisionPoint) -> tuple:
+    """Context group whose raise sizes are counted together (Settings.size_split_aggr)."""
+    if p.street == 0:
+        return (p.context, 0)
+    return ("raise" if p.context in ("facing_bet", "facing_raise") else "bet", p.street)
+
+
+def size_phase(p: DecisionPoint) -> str:
+    """Group whose shown strengths by size are compared: preflop raises, postflop bets
+    (nothing to call) or postflop raises (facing a bet)."""
+    if p.street == 0:
+        return "pre"
+    return "raise" if p.context in ("facing_bet", "facing_raise") else "bet"
+
+
 def outcome_index(kind: str) -> int:
     if kind == FOLD:
         return FOLD_I
@@ -165,10 +183,49 @@ class OpponentModel:
         self.call_strength = MeanStat(pr.call_strength_prior, pr.showdown_strength)
         # mean absolute strength of their range at the moments we bet / raised, per street
         self._bet_strength = {s: MeanStat(0.5, 3.0) for s in (0, 1, 2, 3)}
+        # pot-size share of their aggressive actions per context group ([pot, all]),
+        # and the shown strength of their pot-size vs smaller aggression (preflop
+        # percentile for preflop raises, final strength for postflop ones)
+        self.pot_counts: Dict[tuple, list] = {}
+        self.size_shown = {(ph, pot): [0.0, 0] for ph in ("pre", "bet", "raise") for pot in (False, True)}
+        # preflop percentile of shown hands, per preflop context of their raises ([sum, n])
+        self.pre_shown: Dict[str, list] = {}
         self.hands = 0
         self.showdowns = 0
 
     # ------------------------------------------------------------ queries
+    def pot_size_share(self, p: DecisionPoint, min_n: int, gate_n: int, margin: float) -> Optional[float]:
+        """Share of their aggression in p's context group that is pot-size, once at
+        least ``min_n`` such aggressive actions were seen (postflop: pooled over
+        streets, the street's own counts shrunk toward the pool) and, if ``gate_n`` > 0,
+        their shown pot-size aggression in this phase (preflop raises / postflop bets /
+        postflop raises) is at least ``margin`` stronger than their smaller aggression
+        there, over >= gate_n hands each.
+        None otherwise."""
+        key = size_group(p)
+        if p.street == 0:
+            k, n = self.pot_counts.get(key, (0, 0))
+            if n < min_n:
+                return None
+            q = (k + 0.5) / (n + 1.0)
+        else:
+            kp = n_p = 0
+            for st in (1, 2, 3):
+                kk, nn = self.pot_counts.get((key[0], st), (0, 0))
+                kp += kk
+                n_p += nn
+            if n_p < min_n:
+                return None
+            pool = (kp + 0.5) / (n_p + 1.0)
+            k, n = self.pot_counts.get(key, (0, 0))
+            q = (k + 4.0 * pool) / (n + 4.0)
+        if gate_n > 0:
+            ph = size_phase(p)
+            hi, lo = self.size_shown[(ph, True)], self.size_shown[(ph, False)]
+            if hi[1] < gate_n or lo[1] < gate_n or hi[0] / hi[1] - lo[0] / lo[1] < margin:
+                return None
+        return float(q)
+
     def facing_bet_freqs(self, street: int, frac: float) -> np.ndarray:
         g = self.fb_global.mean()
         s = self.fb_street[street].mean(prior=g)
@@ -251,6 +308,10 @@ class OpponentModel:
         if p.actor != OPP:
             return
         k = outcome_index(p.kind)
+        if p.kind == RAISE:
+            c = self.pot_counts.setdefault(size_group(p), [0, 0])
+            c[0] += int(p.size_frac >= POT_SIZE)
+            c[1] += 1
         if p.street == 0:
             if p.context in self.preflop:
                 self.preflop[p.context].observe(k)
@@ -283,6 +344,17 @@ class OpponentModel:
             bets = [p for p in points if p.actor == OPP and p.kind == RAISE and p.context in ("lead", "checked_to")]
             if any(p.street in scare_streets for p in bets):
                 self.bluff_scare.observe_bool(shown_strength < self.priors.weak_cutoff)
+        for p in points:
+            if p.actor == OPP and p.kind == RAISE:
+                x = shown_preflop_pct if p.street == 0 else shown_strength
+                if x is not None:
+                    c = self.size_shown[(size_phase(p), p.size_frac >= POT_SIZE)]
+                    c[0] += float(x)
+                    c[1] += 1
+                    if p.street == 0:
+                        c = self.pre_shown.setdefault(p.context, [0.0, 0])
+                        c[0] += float(x)
+                        c[1] += 1
         opp_pre = [p for p in points if p.actor == OPP and p.street == 0]
         if shown_preflop_pct is not None and any(p.kind == RAISE for p in opp_pre):
             self.preflop_raise.observe(shown_preflop_pct)

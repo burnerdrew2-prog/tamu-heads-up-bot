@@ -40,6 +40,28 @@ class Settings:
     contention_overhead: bool = False # scale request_overhead by measured wall/CPU of our work
     cheap_version: int = 1            # 1 = original cheap path, 2 = model-aware cheap path
     size_bluff_gate: int = 0          # >0: their bets use a bluff share by size and street group
+    size_split_aggr: bool = False     # their pot-size aggression = the top (pot share) of their aggression
+    size_split_min_n: int = 12        # ... once this many aggressive actions in the context group
+    size_split_gate_n: int = 4        # ... and their shown pot-size aggression beat smaller aggression
+    size_split_margin: float = 0.05   #     by this much in mean strength over >= gate_n hands each
+    size_split_streets: tuple = (0, 1, 2, 3)   # ... on these streets
+    pf_tilt_gate: int = 0             # >0: once this many of their preflop raises in a context were shown,
+    pf_tilt_prior: float = 4.0        #     tilt the range after such a raise toward the shown strength
+    pf_tilt_margin: float = 0.02      #     (shrunk with this many prior hands; only when it is stronger)
+    pf_tilt_contexts: tuple = ("vs_raise", "limp_vs_raise", "vs_reraise", "vs_4bet")
+    eq_calibrate: bool = False        # facing their bet/raise: subtract the measured overestimate of our
+    eq_calib_kinds: tuple = ("raise",)  # equity (est vs true equity vs the hands they showed) for these
+    eq_calib_streets: tuple = (1, 2)  # spots ("raise" = they raised our bet, "bet" = their first bet)
+    eq_calib_gate: int = 6            # ... once this many such spots (pooled over streets) were shown
+    eq_calib_k: float = 10.0          # ... shrunk with k pseudo-spots toward the pool (the pool toward 0)
+    eq_calib_max: float = 0.25        # ... never more than this; never added
+    raise_cap: bool = False           # facing a raise of our bet: no re-raise without a full house or better
+    raise_cap_streets: tuple = (1,)   # ... on these streets
+    raise_cap_gate: str = "calib"     # ... once their raises proved value-heavy: "calib" = our measured equity
+    raise_cap_bias_min: float = 0.05  #     overestimate vs their shown raises >= this (eq_calib_gate spots);
+    raise_cap_bluff_max: float = 0.15 #     "bluff" = bluff_raise share <= this after raise_cap_gate_n
+    raise_cap_gate_n: int = 6         #     shown raises; "always" = no gate
+    raise_cap_eq_min: float = 1.01    # ... a re-raise also stays allowed at eq_reraise >= this (1.01 = never)
                                       #     once that many such bets were shown down
     force_mode: str = ""              # testing: "cheap" / "lite" / "full" for every decision
     load_overhead_slope: float = 0.0  # ... and by 1 + slope * (loadavg per CPU - knee), 1-4x

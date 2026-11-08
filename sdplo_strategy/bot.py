@@ -11,6 +11,8 @@ last history it saw instead.
 """
 from __future__ import annotations
 
+import collections
+import itertools
 import math
 import time
 import traceback
@@ -23,7 +25,7 @@ from .cards import BOARD_LEN, remaining_deck, random_hands
 from .decision import DecisionEngine, Spot
 from .equity import EquityEngine, make_outcomes_fn
 from .history import infer_button, opponent_line, scare_card, walk
-from .opponent import Beta, OpponentModel, Priors, outcome_index
+from .opponent import POT_SIZE, Beta, OpponentModel, Priors, outcome_index
 from .preflop import PreflopScorer, PreflopTable
 from .ranges import RangeTracker, eval_many
 from .settings import Settings
@@ -310,6 +312,22 @@ class _Hand:
     last_obs: Optional[Observation] = None
 
 
+def full_house_or_better(hole, board) -> bool:
+    """Made hand (exactly 2 hole + 3 board cards) is a full house, flush, quads or
+    straight flush - every category from a full house up under either ranking."""
+    if len(board) < 3:
+        return False
+    for h2 in itertools.combinations(hole, 2):
+        for b3 in itertools.combinations(board, 3):
+            cards = h2 + b3
+            if len({c & 3 for c in cards}) == 1:
+                return True
+            cnt = sorted(collections.Counter(c >> 2 for c in cards).values(), reverse=True)
+            if cnt[0] >= 4 or (cnt[0] == 3 and cnt[1] == 2):
+                return True
+    return False
+
+
 class StrategyBot:
     def __init__(self, evaluate: Callable, equity_fn: Optional[Callable] = None,
                  outcomes_fn: Optional[Callable] = None, evaluate_batch: Optional[Callable] = None,
@@ -341,6 +359,8 @@ class StrategyBot:
         self.last_decision: dict = {}
         self._was_cheap = False
         self._pending_bets: list = []     # (hand number, model's raw fold share) for our postflop bets
+        self._pending_eq: list = []       # (spot key, raw equity estimate, hole, board) this hand
+        self._eq_calib: dict = {}         # spot key -> [sum of (estimate - true equity), n]
         self._mode = "full"               # time tier of the current decision (full / lite / cheap)
 
     # -------------------------------------------------------------- public
@@ -534,13 +554,26 @@ class StrategyBot:
                 continue
             hs.range.set_board(obs.board[:BOARD_LEN[p.street]])
             freqs = self.model.freqs(p.context, p.street, p.frac)
+            if (self.s.size_split_aggr and p.kind == RAISE and p.size_frac >= POT_SIZE
+                    and p.street in self.s.size_split_streets):
+                q = self.model.pot_size_share(p, self.s.size_split_min_n, self.s.size_split_gate_n,
+                                              self.s.size_split_margin)
+                if q is not None and q < 1.0:
+                    f0, p0, a0 = (float(x) for x in freqs)
+                    freqs = np.array([f0, p0 + a0 * (1.0 - q), a0 * q])
             bshare = bluff_of(p.context, p.street) * (0.5 if p.street == 0 else 1.0)
             if (self.s.size_bluff_gate > 0 and p.kind == RAISE and p.street > 0
                     and p.context in ("lead", "checked_to")):
                 sb = self.model.size_bluff_share(p.size_frac, p.street, self.s.size_bluff_gate)
                 if sb is not None:
                     bshare = sb
-            hs.range.observe(outcome_index(p.kind), freqs,
+            tilt = None
+            if (self.s.pf_tilt_gate > 0 and p.street == 0 and p.kind == RAISE
+                    and p.context in self.s.pf_tilt_contexts):
+                shown = self.model.pre_shown.get(p.context)
+                if shown is not None and shown[1] >= self.s.pf_tilt_gate:
+                    tilt = (shown[0], shown[1], self.s.pf_tilt_prior, self.s.pf_tilt_margin)
+            hs.range.observe(outcome_index(p.kind), freqs, tilt=tilt,
                              bluff_share=bshare,
                              informativeness=kappa[0] if p.street == 0 else kappa[1],
                              call_informativeness=None if p.street == 0 else kappa_call)
@@ -572,7 +605,28 @@ class StrategyBot:
             deadline = t0 + self.timer.limit(obs.hand_number) * self.s.hard_stop_frac
             if self.s.match_time_budget is None and self.s.time_free_without_bank:
                 deadline = None
+        calib_key = None
+        facing_raise = False
+        if obs.street > 0 and obs.to_call > 0:
+            last = next((q for q in reversed(points) if q.actor == OPP), None)
+            if last is not None and last.kind == RAISE and last.street == obs.street:
+                kind = "raise" if last.context in ("facing_bet", "facing_raise") else "bet"
+                facing_raise = kind == "raise"
+                track = (self.s.eq_calibrate and obs.street in self.s.eq_calib_streets
+                         and kind in self.s.eq_calib_kinds)
+                if track or (self.s.raise_cap and facing_raise and self.s.raise_cap_gate == "calib"):
+                    calib_key = (obs.street, kind, bool(last.size_frac >= POT_SIZE))
+                if track:
+                    spot.eq_shift = self._eq_shift(calib_key)
         eq, options, used = self.engine.evaluate(spot, hs.range, n, self.rng, deadline, lite=lite)
+        if calib_key is not None:
+            self._pending_eq.append((calib_key, self.engine.last_raw_eq, tuple(obs.hole), tuple(obs.board)))
+        if (self.s.raise_cap and facing_raise and obs.street in self.s.raise_cap_streets
+                and self._raise_cap_active(obs.street) and not full_house_or_better(obs.hole, obs.board)):
+            kept = [o for o in options if o.action.kind != RAISE
+                    or o.info.get("eq_reraise", 0.0) >= self.s.raise_cap_eq_min]
+            if any(o.action.kind != RAISE for o in kept):
+                options = kept
         vr = self.value_rate.get(obs.street)
         opt, reason = self.engine.choose(spot, eq, options, self.rng, vr.p if vr else 0.3)
         if opt.action.kind == RAISE:
@@ -601,6 +655,12 @@ class StrategyBot:
                          split_open_size=self.s.split_open_size)
         line = opponent_line(points)
         self._settle_bets(points)
+        pend, self._pending_eq = self._pending_eq, []
+        if pend and opp_hole is not None and len(opp_hole) == 5 and board is not None and len(board) == 5:
+            for key, est, hole, bd in pend:
+                c = self._eq_calib.setdefault(key, [0.0, 0])
+                c[0] += est - self._true_equity(hole, tuple(opp_hole), bd)
+                c[1] += 1
         shown = shown_pre = None
         if opp_hole is not None and len(opp_hole) == 5 and board is not None and len(board) == 5:
             shown = self._showdown_strength(tuple(opp_hole), tuple(board))
@@ -623,6 +683,55 @@ class StrategyBot:
             outcomes.append(nxt is not None and nxt.kind == FOLD and nxt.street == p.street)
         for (hn, pred), folded in zip(pend[-len(outcomes):] if outcomes else [], outcomes[-len(pend):]):
             self.engine.record_fold_outcome(pred, folded)
+
+    def _raise_cap_active(self, street: int) -> bool:
+        """Raise cap gate (Settings.raise_cap): their raises of our bets proved value-heavy."""
+        g = self.s.raise_cap_gate
+        if g == "always":
+            return True
+        if g == "bluff":
+            b = self.model.bluff_raise
+            return b.n >= self.s.raise_cap_gate_n and b.p <= self.s.raise_cap_bluff_max
+        tot = n = 0.0                  # "calib": pooled overestimate over streets and sizes
+        for (st, kind, pot), c in self._eq_calib.items():
+            if kind == "raise":
+                tot += c[0]
+                n += c[1]
+        return n >= self.s.eq_calib_gate and tot / n >= self.s.raise_cap_bias_min
+
+    def _eq_shift(self, key) -> float:
+        """Measured overestimate of our equity in spots like ``key`` (street, kind,
+        pot-size): the street's own mean shrunk toward the pool over streets, the
+        pool shrunk toward 0; 0 until the pool has eq_calib_gate shown spots."""
+        st, kind, pot = key
+        k = self.s.eq_calib_k
+        tot = n = 0.0
+        for s2 in (1, 2, 3):
+            c = self._eq_calib.get((s2, kind, pot))
+            if c:
+                tot += c[0]
+                n += c[1]
+        if n < self.s.eq_calib_gate:
+            return 0.0
+        pool = tot / (n + k)
+        c = self._eq_calib.get(key, (0.0, 0))
+        m = (c[0] + k * pool) / (c[1] + k)
+        return float(min(self.s.eq_calib_max, max(0.0, m)))
+
+    def _true_equity(self, hole: tuple, opp: tuple, board: tuple) -> float:
+        """Our exact equity vs their actual hand on ``board`` (all runouts)."""
+        rest = remaining_deck(tuple(hole) + tuple(opp) + tuple(board))
+        need = 5 - len(board)
+        runs = list(itertools.combinations(rest.tolist(), need)) if need > 0 else [()]
+        boards = np.array([list(board) + list(r) for r in runs], dtype=np.int64)
+        if self.evaluate_batch is not None:
+            n = len(boards)
+            a = np.asarray(self.evaluate_batch(np.tile(np.array(sorted(hole)), (n, 1)), boards))
+            b = np.asarray(self.evaluate_batch(np.tile(np.array(sorted(opp)), (n, 1)), boards))
+        else:
+            a = np.array([self.evaluate(hole, tuple(bd)) for bd in boards])
+            b = np.array([self.evaluate(opp, tuple(bd)) for bd in boards])
+        return float(((a > b) + 0.5 * (a == b)).mean())
 
     def _showdown_strength(self, opp_hole: tuple, board: tuple) -> float:
         """Percentile of the shown hand vs random hands on the final board."""
